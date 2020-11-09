@@ -1528,6 +1528,18 @@ public:
     return table->can_be_evicted ? find<true>(table) : find<false>(table);
   }
 #endif
+private:
+  /** Invoke f on each index of a table, until it returns false
+  @param f function object
+  @param t table
+  @retval false if f returned false
+  @retval true if f never returned false */
+  template<typename F> inline bool for_each_index(const F &f, dict_table_t *t);
+public:
+  /** Invoke f on each index of each persistent table, until it returns false
+  @retval false if f returned false
+  @retval true if f never returned false */
+  template<typename F> inline bool for_each_index(const F &f);
 
   /** Move a table to the non-LRU list from the LRU list. */
   void prevent_eviction(dict_table_t* table)
@@ -1585,6 +1597,46 @@ extern dict_sys_t	dict_sys;
 #define dict_table_prevent_eviction(table) dict_sys.prevent_eviction(table)
 #define dict_sys_lock() dict_sys.lock(__FILE__, __LINE__)
 #define dict_sys_unlock() dict_sys.unlock()
+
+template<typename F>
+inline bool dict_sys_t::for_each_index(const F &f, dict_table_t *t)
+{
+  bool r= true;
+  t->acquire();
+  dict_index_t *i= UT_LIST_GET_FIRST(t->indexes);
+  do
+  {
+    if (!i->is_corrupted())
+    {
+      mutex_exit(&dict_sys.mutex);
+      r= f(*i);
+      mutex_enter(&dict_sys.mutex);
+    }
+    i= UT_LIST_GET_NEXT(indexes, i);
+  }
+  while (r && i);
+  t->release();
+  return r;
+}
+
+template<typename F>
+inline bool dict_sys_t::for_each_index(const F &f)
+{
+  struct Locking
+  {
+    Locking() { mutex_enter(&dict_sys.mutex); }
+    ~Locking() { mutex_exit(&dict_sys.mutex); }
+  } locking;
+  for (const dict_table_t *t= UT_LIST_GET_FIRST(table_non_LRU);
+       t; t= UT_LIST_GET_NEXT(table_LRU, t))
+    if (!for_each_index(f, t))
+      return false;
+  for (const dict_table_t *t= UT_LIST_GET_FIRST(table_LRU);
+       t; t= UT_LIST_GET_NEXT(table_LRU, t))
+    if (!for_each_index(f, t))
+      return false;
+  return true;
+}
 
 /* Auxiliary structs for checking a table definition @{ */
 
