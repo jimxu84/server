@@ -574,7 +574,9 @@ static PSI_mutex_info all_innodb_mutexes[] = {
 performance schema instrumented if "UNIV_PFS_RWLOCK"
 is defined */
 static PSI_rwlock_info all_innodb_rwlocks[] = {
-	PSI_RWLOCK_KEY(btr_search_latch),
+#  ifdef BTR_CUR_HASH_ADAPT
+	{ &btr_search_latch_key, "btr_search_latch", 0 },
+#  endif
 #  ifndef PFS_SKIP_BUFFER_MUTEX_RWLOCK
 	PSI_RWLOCK_KEY(buf_block_lock),
 #  endif /* !PFS_SKIP_BUFFER_MUTEX_RWLOCK */
