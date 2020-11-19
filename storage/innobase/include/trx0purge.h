@@ -29,6 +29,7 @@ Created 3/26/1996 Heikki Tuuri
 
 #include "trx0rseg.h"
 #include "que0types.h"
+#include "frw_lock.h"
 
 #include <queue>
 
@@ -127,8 +128,7 @@ class purge_sys_t
 {
 public:
 	/** latch protecting view, m_enabled */
-	MY_ALIGNED(CACHE_LINE_SIZE)
-	mutable rw_lock_t		latch;
+	MY_ALIGNED(CACHE_LINE_SIZE) mutable frw_lock latch;
 private:
 	/** The purge will not remove undo logs which are >= this view */
 	MY_ALIGNED(CACHE_LINE_SIZE)
@@ -249,23 +249,20 @@ public:
   /** A wrapper around ReadView::changes_visible(). */
   bool changes_visible(trx_id_t id, const table_name_t &name) const
   {
-    ut_ad(rw_lock_own(&latch, RW_LOCK_S));
     return view.changes_visible(id, name);
   }
   /** A wrapper around ReadView::low_limit_no(). */
   trx_id_t low_limit_no() const
   {
-#if 0 /* Unfortunately we don't hold this assertion, see MDEV-22718. */
-    ut_ad(rw_lock_own(&latch, RW_LOCK_S));
-#endif
+    /* MDEV-22718 FIXME: We are not holding latch here! */
     return view.low_limit_no();
   }
   /** A wrapper around trx_sys_t::clone_oldest_view(). */
   void clone_oldest_view()
   {
-    rw_lock_x_lock(&latch);
+    latch.wr_lock();
     trx_sys.clone_oldest_view(&view);
-    rw_lock_x_unlock(&latch);
+    latch.wr_unlock();
   }
 };
 
