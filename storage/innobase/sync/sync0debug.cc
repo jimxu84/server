@@ -1303,11 +1303,11 @@ sync_latch_meta_init()
 
 	// Add the RW locks
 	LATCH_ADD_RWLOCK(BUF_BLOCK_LOCK, SYNC_LEVEL_VARYING,
-			 buf_block_lock_key);
+			 PFS_NOT_INSTRUMENTED);
 
 #ifdef UNIV_DEBUG
 	LATCH_ADD_RWLOCK(BUF_BLOCK_DEBUG, SYNC_LEVEL_VARYING,
-			 buf_block_debug_latch_key);
+			 PFS_NOT_INSTRUMENTED);
 #endif /* UNIV_DEBUG */
 
 	LATCH_ADD_RWLOCK(DICT_OPERATION, SYNC_DICT_OPERATION,

@@ -577,12 +577,6 @@ static PSI_rwlock_info all_innodb_rwlocks[] = {
 #  ifdef BTR_CUR_HASH_ADAPT
 	{ &btr_search_latch_key, "btr_search_latch", 0 },
 #  endif
-#  ifndef PFS_SKIP_BUFFER_MUTEX_RWLOCK
-	PSI_RWLOCK_KEY(buf_block_lock),
-#  endif /* !PFS_SKIP_BUFFER_MUTEX_RWLOCK */
-#  ifdef UNIV_DEBUG
-	PSI_RWLOCK_KEY(buf_block_debug_latch),
-#  endif /* UNIV_DEBUG */
 	PSI_RWLOCK_KEY(dict_operation_lock),
 	PSI_RWLOCK_KEY(fil_space_latch),
 	PSI_RWLOCK_KEY(fts_cache_rw_lock),
