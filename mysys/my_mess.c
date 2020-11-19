@@ -21,6 +21,9 @@ void my_message_stderr(uint error __attribute__((unused)),
   DBUG_ENTER("my_message_stderr");
   DBUG_PRINT("enter",("message: %s",str));
   (void) fflush(stdout);
+  if (MyFlags & ME_NOTE)
+    DBUG_VOID_RETURN;
+
   if (MyFlags & ME_BELL)
     (void) fputc('\007', stderr);
   if (my_progname)
