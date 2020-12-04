@@ -6555,6 +6555,11 @@ opt_compressed:
         | compressed { }
         ;
 
+opt_enable:
+          /* empty */ {}
+        | ENABLE_SYM { }
+        ;
+
 compressed:
           COMPRESSED_SYM opt_compression_method
           {
@@ -6581,7 +6586,7 @@ compressed_deprecated_column_attribute:
         ;
 
 asrow_attribute:
-          not NULL_SYM
+          not NULL_SYM opt_enable
           {
             Lex->last_field->flags|= NOT_NULL_FLAG;
           }
@@ -17045,6 +17050,7 @@ object_privilege:
         | BINLOG_SYM REPLAY_SYM            { $$= BINLOG_REPLAY_ACL; }
         | REPLICATION MASTER_SYM ADMIN_SYM { $$= REPL_MASTER_ADMIN_ACL; }
         | REPLICATION SLAVE ADMIN_SYM      { $$= REPL_SLAVE_ADMIN_ACL; }
+        | SLAVE MONITOR_SYM                { $$= SLAVE_MONITOR_ACL; }
         ;
 
 opt_and:

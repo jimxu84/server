@@ -1518,7 +1518,7 @@ dict_stats_analyze_index_below_cur(
 
 		block = buf_page_get_gen(page_id, zip_size,
 					 RW_S_LATCH, NULL, BUF_GET,
-					 __FILE__, __LINE__, &mtr, &err,
+					 &mtr, &err,
 					 !index->is_clust()
 					 && 1 == btr_page_get_level(page));
 
@@ -1981,7 +1981,7 @@ static index_stats_t dict_stats_analyze_index(dict_index_t* index)
 	since it will be faster and will give better results. */
 
 	if (root_level == 0
-	    || N_SAMPLE_PAGES(index) * n_uniq > index->stat_n_leaf_pages) {
+	    || N_SAMPLE_PAGES(index) * n_uniq > result.n_leaf_pages) {
 
 		if (root_level == 0) {
 			DEBUG_PRINTF("  %s(): just one page,"

@@ -186,7 +186,7 @@ tpool::thread_pool* srv_thread_pool;
 
 /** Maximum number of times allowed to conditionally acquire
 mutex before switching to blocking wait on the mutex */
-#define MAX_MUTEX_NOWAIT	20
+#define MAX_MUTEX_NOWAIT	2
 
 /** Check whether the number of failed nonblocking mutex
 acquisition attempts exceeds maximum allowed value. If so,
@@ -555,8 +555,7 @@ struct purge_coordinator_state
 
 static purge_coordinator_state purge_state;
 
-/** threadpool timer for srv_error_monitor_task(). */
-std::unique_ptr<tpool::timer> srv_error_monitor_timer;
+/** threadpool timer for srv_monitor_task() */
 std::unique_ptr<tpool::timer> srv_monitor_timer;
 
 
@@ -708,7 +707,7 @@ static void srv_init()
 	ut_d(srv_master_thread_disabled_event = os_event_create(0));
 
 	/* page_zip_stat_per_index_mutex is acquired from:
-	1. page_zip_compress() (after SYNC_FSP)
+	1. page_zip_compress()
 	2. page_zip_decompress()
 	3. i_s_cmp_per_index_fill_low() (where SYNC_DICT is acquired)
 	4. innodb_cmp_per_index_update(), no other latches
@@ -769,16 +768,11 @@ srv_boot(void)
 
 /******************************************************************//**
 Refreshes the values used to calculate per-second averages. */
-static
-void
-srv_refresh_innodb_monitor_stats(void)
-/*==================================*/
+static void srv_refresh_innodb_monitor_stats(time_t current_time)
 {
 	mutex_enter(&srv_innodb_monitor_mutex);
 
-	time_t current_time = time(NULL);
-
-	if (difftime(current_time, srv_last_monitor_time) <= 60) {
+	if (difftime(current_time, srv_last_monitor_time) < 60) {
 		/* We referesh InnoDB Monitor values so that averages are
 		printed from at most 60 last seconds */
 		mutex_exit(&srv_innodb_monitor_mutex);
@@ -861,7 +855,7 @@ srv_printf_innodb_monitor(
 	      "SEMAPHORES\n"
 	      "----------\n", file);
 
-	sync_print(file);
+	sync_array_print(file);
 
 	/* Conceptually, srv_innodb_monitor_mutex has a very high latching
 	order level in sync0sync.h, while dict_foreign_err_mutex has a very
@@ -924,13 +918,13 @@ srv_printf_innodb_monitor(
 #ifdef BTR_CUR_HASH_ADAPT
 	for (ulint i = 0; i < btr_ahi_parts && btr_search_enabled; ++i) {
 		const auto part= &btr_search_sys.parts[i];
-		rw_lock_s_lock(&part->latch);
+		part->latch.rd_lock(SRW_LOCK_CALL);
 		ut_ad(part->heap->type == MEM_HEAP_FOR_BTR_SEARCH);
 		fprintf(file, "Hash table size " ULINTPF
 			", node heap has " ULINTPF " buffer(s)\n",
 			part->table.n_cells,
 			part->heap->base.count - !part->heap->free_block);
-		rw_lock_s_unlock(&part->latch);
+		part->latch.rd_unlock();
 	}
 
 	fprintf(file,
@@ -1065,14 +1059,14 @@ srv_export_innodb_status(void)
 	ulint mem_adaptive_hash = 0;
 	for (ulong i = 0; i < btr_ahi_parts; i++) {
 		const auto part= &btr_search_sys.parts[i];
-		rw_lock_s_lock(&part->latch);
+		part->latch.rd_lock(SRW_LOCK_CALL);
 		if (part->heap) {
 			ut_ad(part->heap->type == MEM_HEAP_FOR_BTR_SEARCH);
 
 			mem_adaptive_hash += mem_heap_get_size(part->heap)
 				+ part->table.n_cells * sizeof(hash_cell_t);
 		}
-		rw_lock_s_unlock(&part->latch);
+		part->latch.rd_unlock();
 	}
 	export_vars.innodb_mem_adaptive_hash = mem_adaptive_hash;
 #endif
@@ -1309,26 +1303,18 @@ struct srv_monitor_state_t
 static srv_monitor_state_t monitor_state;
 
 /** A task which prints the info output by various InnoDB monitors.*/
-void srv_monitor_task(void*)
+static void srv_monitor()
 {
-	double		time_elapsed;
-	time_t		current_time;
+	time_t current_time = time(NULL);
 
-	ut_ad(!srv_read_only_mode);
-
-	current_time = time(NULL);
-
-	time_elapsed = difftime(current_time, monitor_state.last_monitor_time);
-
-	if (time_elapsed > 15) {
+	if (difftime(current_time, monitor_state.last_monitor_time) >= 15) {
 		monitor_state.last_monitor_time = current_time;
 
 		if (srv_print_innodb_monitor) {
 			/* Reset mutex_skipped counter everytime
 			srv_print_innodb_monitor changes. This is to
 			ensure we will not be blocked by lock_sys.mutex
-			for short duration information printing,
-			such as requested by sync_array_print_long_waits() */
+			for short duration information printing */
 			if (!monitor_state.last_srv_print_monitor) {
 				monitor_state.mutex_skipped = 0;
 				monitor_state.last_srv_print_monitor = true;
@@ -1366,14 +1352,14 @@ void srv_monitor_task(void*)
 		}
 	}
 
-	srv_refresh_innodb_monitor_stats();
+	srv_refresh_innodb_monitor_stats(current_time);
 }
 
 /*********************************************************************//**
 A task which prints warnings about semaphore waits which have lasted
 too long. These can be used to track bugs which cause hangs.
 */
-void srv_error_monitor_task(void*)
+void srv_monitor_task(void*)
 {
 	/* number of successive fatal timeouts observed */
 	static ulint		fatal_cnt;
@@ -1408,20 +1394,17 @@ void srv_error_monitor_task(void*)
 	if (sync_array_print_long_waits(&waiter, &sema)
 	    && sema == old_sema && os_thread_eq(waiter, old_waiter)) {
 #if defined(WITH_WSREP) && defined(WITH_INNODB_DISALLOW_WRITES)
-	  if (os_event_is_set(srv_allow_writes_event)) {
+		if (!os_event_is_set(srv_allow_writes_event)) {
+			fprintf(stderr,
+				"WSREP: avoiding InnoDB self crash due to "
+				"long semaphore wait of  > %lu seconds\n"
+				"Server is processing SST donor operation, "
+				"fatal_cnt now: " ULINTPF,
+				srv_fatal_semaphore_wait_threshold, fatal_cnt);
+			return;
+		}
 #endif /* WITH_WSREP */
-		fatal_cnt++;
-#if defined(WITH_WSREP) && defined(WITH_INNODB_DISALLOW_WRITES)
-	  } else {
-		fprintf(stderr,
-			"WSREP: avoiding InnoDB self crash due to long "
-			"semaphore wait of  > %lu seconds\n"
-			"Server is processing SST donor operation, "
-			"fatal_cnt now: " ULINTPF,
-			srv_fatal_semaphore_wait_threshold, fatal_cnt);
-	  }
-#endif /* WITH_WSREP */
-		if (fatal_cnt > 10) {
+		if (fatal_cnt++) {
 			ib::fatal() << "Semaphore wait has lasted > "
 				<< srv_fatal_semaphore_wait_threshold
 				<< " seconds. We intentionally crash the"
@@ -1432,6 +1415,8 @@ void srv_error_monitor_task(void*)
 		old_waiter = waiter;
 		old_sema = sema;
 	}
+
+	srv_monitor();
 }
 
 /******************************************************************//**
@@ -1492,13 +1477,13 @@ bool purge_sys_t::running() const
 /** Stop purge during FLUSH TABLES FOR EXPORT */
 void purge_sys_t::stop()
 {
-  rw_lock_x_lock(&latch);
+  latch.wr_lock(SRW_LOCK_CALL);
 
   if (!enabled())
   {
     /* Shutdown must have been initiated during FLUSH TABLES FOR EXPORT. */
     ut_ad(!srv_undo_sources);
-    rw_lock_x_unlock(&latch);
+    latch.wr_unlock();
     return;
   }
 
@@ -1506,7 +1491,7 @@ void purge_sys_t::stop()
 
   const auto paused= m_paused++;
 
-  rw_lock_x_unlock(&latch);
+  latch.wr_unlock();
 
   if (!paused)
   {
@@ -1529,7 +1514,7 @@ void purge_sys_t::resume()
    ut_ad(srv_force_recovery < SRV_FORCE_NO_BACKGROUND);
    ut_ad(!sync_check_iterate(sync_check()));
    purge_coordinator_task.enable();
-   rw_lock_x_lock(&latch);
+   latch.wr_lock(SRW_LOCK_CALL);
    int32_t paused= m_paused--;
    ut_a(paused);
 
@@ -1540,7 +1525,7 @@ void purge_sys_t::resume()
      srv_wake_purge_thread_if_not_active();
      MONITOR_ATOMIC_INC(MONITOR_PURGE_RESUME_COUNT);
    }
-   rw_lock_x_unlock(&latch);
+   latch.wr_unlock();
 }
 
 /*******************************************************************//**

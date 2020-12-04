@@ -129,7 +129,6 @@ inline buf_block_t *fsp_get_header(const fil_space_t *space, mtr_t *mtr)
 {
  buf_block_t *block= buf_page_get(page_id_t(space->id, 0), space->zip_size(),
                                   RW_SX_LATCH, mtr);
- buf_block_dbg_add_level(block, SYNC_FSP_PAGE);
  ut_ad(space->id == mach_read_from_4(FSP_HEADER_OFFSET + FSP_SPACE_ID +
                                      block->frame));
  return block;
@@ -318,7 +317,7 @@ xdes_get_descriptor_with_space_hdr(
 	mtr_t*			mtr,
 	bool			init_space = false)
 {
-	ut_ad(mtr->memo_contains(*space));
+	ut_ad(space->is_owner());
 	ut_ad(mtr->memo_contains_flagged(header, MTR_MEMO_PAGE_SX_FIX
 					 | MTR_MEMO_PAGE_X_FIX));
 	/* Read free limit and space size */
@@ -349,8 +348,6 @@ xdes_get_descriptor_with_space_hdr(
 		block = buf_page_get(
 			page_id_t(space->id, descr_page_no), zip_size,
 			RW_SX_LATCH, mtr);
-
-		buf_block_dbg_add_level(block, SYNC_FSP_PAGE);
 	}
 
 	if (desc_block != NULL) {
@@ -379,7 +376,6 @@ static xdes_t* xdes_get_descriptor(const fil_space_t *space, page_no_t offset,
 {
   buf_block_t *block= buf_page_get(page_id_t(space->id, 0), space->zip_size(),
                                    RW_SX_LATCH, mtr);
-  buf_block_dbg_add_level(block, SYNC_FSP_PAGE);
   return xdes_get_descriptor_with_space_hdr(block, space, offset, xdes, mtr);
 }
 
@@ -404,7 +400,7 @@ xdes_get_descriptor_const(
 	page_no_t		offset,
 	mtr_t*			mtr)
 {
-	ut_ad(mtr->memo_contains(space->latch, MTR_MEMO_S_LOCK));
+	ut_ad(mtr->memo_contains(*space, true));
 	ut_ad(offset < space->free_limit);
 	ut_ad(offset < space->size_in_header);
 
@@ -412,8 +408,6 @@ xdes_get_descriptor_const(
 
 	if (buf_block_t* block = buf_page_get(page_id_t(space->id, page),
 					      zip_size, RW_S_LATCH, mtr)) {
-		buf_block_dbg_add_level(block, SYNC_FSP_PAGE);
-
 		ut_ad(page != 0 || space->free_limit == mach_read_from_4(
 			      FSP_FREE_LIMIT + FSP_HEADER_OFFSET
 			      + block->frame));
@@ -549,12 +543,10 @@ void fsp_header_init(fil_space_t* space, uint32_t size, mtr_t* mtr)
 
 	buf_block_t *free_block = buf_LRU_get_free_block(false);
 
-	mtr_x_lock_space(space, mtr);
+	mtr->x_lock_space(space);
 
 	buf_block_t* block = buf_page_create(space, 0, zip_size, mtr,
 					     free_block);
-	buf_block_dbg_add_level(block, SYNC_FSP_PAGE);
-
 	if (UNIV_UNLIKELY(block != free_block)) {
 		buf_pool.free_block(free_block);
 	}
@@ -877,7 +869,6 @@ fsp_fill_free_list(
 				block= buf_page_create(
 					space, static_cast<uint32_t>(i),
 					zip_size, mtr, f);
-				buf_block_dbg_add_level(block, SYNC_FSP_PAGE);
 				if (UNIV_UNLIKELY(block != f)) {
 					buf_pool.free_block(f);
 				}
@@ -894,7 +885,6 @@ fsp_fill_free_list(
 					static_cast<uint32_t>(
 						i + FSP_IBUF_BITMAP_OFFSET),
 					zip_size, mtr, f);
-				buf_block_dbg_add_level(block, SYNC_FSP_PAGE);
 				if (UNIV_UNLIKELY(block != f)) {
 					buf_pool.free_block(f);
 				}
@@ -905,7 +895,7 @@ fsp_fill_free_list(
 			}
 		}
 
-		buf_block_t* xdes;
+		buf_block_t* xdes = nullptr;
 		xdes_t*	descr = xdes_get_descriptor_with_space_hdr(
 			header, space, i, &xdes, mtr, init_space);
 		if (xdes != header && !space->full_crc32()) {
@@ -1262,7 +1252,7 @@ static void fsp_free_page(fil_space_t* space, page_no_t offset, mtr_t* mtr)
 @param[in,out]  mtr     mini-transaction */
 static void fsp_free_extent(fil_space_t* space, page_no_t offset, mtr_t* mtr)
 {
-  ut_ad(mtr->memo_contains(*space));
+  ut_ad(space->is_owner());
 
   buf_block_t *block= fsp_get_header(space, mtr);
   buf_block_t *xdes= 0;
@@ -1357,8 +1347,7 @@ fsp_alloc_seg_inode_page(fil_space_t *space, buf_block_t *header, mtr_t *mtr)
   if (!block)
     return false;
 
-  buf_block_dbg_add_level(block, SYNC_FSP_PAGE);
-  ut_ad(rw_lock_get_x_lock_count(&block->lock) == 1);
+  ut_ad(block->lock.not_recursive());
 
   mtr->write<2>(*block, block->frame + FIL_PAGE_TYPE, FIL_PAGE_INODE);
 
@@ -1401,7 +1390,6 @@ fsp_alloc_seg_inode(fil_space_t *space, buf_block_t *header,
 			       + header->frame).page);
 
 	block = buf_page_get(page_id, space->zip_size(), RW_SX_LATCH, mtr);
-	buf_block_dbg_add_level(block, SYNC_FSP_PAGE);
 	if (!space->full_crc32()) {
 		fil_block_check_type(*block, FIL_PAGE_INODE, mtr);
 	}
@@ -1650,7 +1638,7 @@ fseg_create(fil_space_t *space, ulint byte_offset, mtr_t *mtr,
 	ut_ad(byte_offset + FSEG_HEADER_SIZE
 	      <= srv_page_size - FIL_PAGE_DATA_END);
 
-	mtr_x_lock_space(space, mtr);
+	mtr->x_lock_space(space);
 	ut_d(space->modify_check(*mtr));
 
 	if (block) {
@@ -1719,7 +1707,7 @@ fseg_create(fil_space_t *space, ulint byte_offset, mtr_t *mtr,
 			goto funct_exit;
 		}
 
-		ut_ad(rw_lock_get_x_lock_count(&block->lock) == 1);
+		ut_ad(block->lock.not_recursive());
 		ut_ad(!fil_page_get_type(block->frame));
 		mtr->write<1>(*block, FIL_PAGE_TYPE + 1 + block->frame,
 			      FIL_PAGE_TYPE_SYS);
@@ -2199,7 +2187,7 @@ fseg_alloc_free_page_general(
 	uint32_t	n_reserved;
 
 	space_id = page_get_space_id(page_align(seg_header));
-	space = mtr_x_lock_space(space_id, mtr);
+	space = mtr->x_lock_space(space_id);
 	inode = fseg_inode_get(seg_header, space_id, space->zip_size(),
 			       mtr, &iblock);
 	if (!space->full_crc32()) {
@@ -2323,7 +2311,7 @@ fsp_reserve_free_extents(
 
 	const uint32_t extent_size = FSP_EXTENT_SIZE;
 
-	mtr_x_lock_space(space, mtr);
+	mtr->x_lock_space(space);
 	const unsigned physical_size = space->physical_size();
 
 	buf_block_t* header = fsp_get_header(space, mtr);
@@ -2528,18 +2516,24 @@ fseg_free_page_low(
 @param[in,out]	seg_header	file segment header
 @param[in,out]	space		tablespace
 @param[in]	offset		page number
-@param[in,out]	mtr		mini-transaction */
+@param[in,out]	mtr		mini-transaction
+@param[in]	have_latch	whether space->x_lock() was already called */
 void
 fseg_free_page(
 	fseg_header_t*	seg_header,
 	fil_space_t*	space,
 	uint32_t	offset,
-	mtr_t*		mtr)
+	mtr_t*		mtr,
+	bool		have_latch)
 {
 	DBUG_ENTER("fseg_free_page");
 	fseg_inode_t*		seg_inode;
 	buf_block_t*		iblock;
-	mtr_x_lock_space(space, mtr);
+	if (have_latch) {
+		ut_ad(space->is_owner());
+	} else {
+		mtr->x_lock_space(space);
+	}
 
 	DBUG_LOG("fseg_free_page", "space_id: " << space->id
 		 << ", page_no: " << offset);
@@ -2569,7 +2563,7 @@ fseg_page_is_free(fil_space_t* space, unsigned page)
 							  page);
 
 	mtr.start();
-	mtr_s_lock_space(space, &mtr);
+	mtr.s_lock_space(space);
 
 	if (page >= space->free_limit || page >= space->size_in_header) {
 		is_free = true;
@@ -2639,7 +2633,7 @@ fseg_free_extent(
 		if (!xdes_is_free(descr, i)) {
 			buf_page_free(
 			  page_id_t(space->id, first_page_in_extent + 1),
-			  mtr, __FILE__, __LINE__);
+			  mtr);
 		}
 	}
 }
@@ -2666,7 +2660,7 @@ fseg_free_step(
 	const uint32_t space_id = page_get_space_id(page_align(header));
 	const uint32_t header_page = page_get_page_no(page_align(header));
 
-	fil_space_t* space = mtr_x_lock_space(space_id, mtr);
+	fil_space_t* space = mtr->x_lock_space(space_id);
 	buf_block_t* xdes;
 	xdes_t* descr = xdes_get_descriptor(space, header_page, &xdes, mtr);
 
@@ -2740,7 +2734,7 @@ fseg_free_step_not_header(
 	const uint32_t space_id = page_get_space_id(page_align(header));
 	ut_ad(mtr->is_named_space(space_id));
 
-	fil_space_t*		space = mtr_x_lock_space(space_id, mtr);
+	fil_space_t*		space = mtr->x_lock_space(space_id);
 	buf_block_t*		iblock;
 
 	inode = fseg_inode_get(header, space_id, space->zip_size(), mtr,

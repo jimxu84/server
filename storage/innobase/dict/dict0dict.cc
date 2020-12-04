@@ -1038,7 +1038,7 @@ void dict_sys_t::create()
   table_id_hash.create(hash_size);
   temp_id_hash.create(hash_size);
 
-  rw_lock_create(dict_operation_lock_key, &latch, SYNC_DICT_OPERATION);
+  latch.SRW_LOCK_INIT(dict_operation_lock_key);
 
   if (!srv_read_only_mode)
   {
@@ -1305,10 +1305,10 @@ dict_index_t *dict_index_t::clone() const
               sizeof *stat_n_non_null_key_vals);
 
   mem_heap_t* heap= mem_heap_create(size);
-  dict_index_t *index= static_cast<dict_index_t*>(mem_heap_dup(heap, this,
-                                                               sizeof *this));
+  dict_index_t *index= static_cast<dict_index_t*>
+    (mem_heap_alloc(heap, sizeof *this));
   *index= *this;
-  rw_lock_create(index_tree_rw_lock_key, &index->lock, SYNC_INDEX_TREE);
+  index->lock.SRW_LOCK_INIT(index_tree_rw_lock_key);
   index->heap= heap;
   index->name= mem_heap_strdup(heap, name);
   index->fields= static_cast<dict_field_t*>
@@ -2157,8 +2157,7 @@ dict_index_add_to_cache(
 #endif /* BTR_CUR_ADAPT */
 
 	new_index->page = unsigned(page_no);
-	rw_lock_create(index_tree_rw_lock_key, &new_index->lock,
-		       SYNC_INDEX_TREE);
+	new_index->lock.SRW_LOCK_INIT(index_tree_rw_lock_key);
 
 	new_index->n_core_fields = new_index->n_fields;
 
@@ -2193,6 +2192,7 @@ dict_index_remove_from_cache_low(
 	if (index->online_log) {
 		ut_ad(index->online_status == ONLINE_INDEX_CREATION);
 		row_log_free(index->online_log);
+		index->online_log = NULL;
 	}
 
 	/* Remove the index from the list of indexes of the table */
@@ -2227,7 +2227,7 @@ dict_index_remove_from_cache_low(
 	}
 #endif /* BTR_CUR_HASH_ADAPT */
 
-	rw_lock_free(&index->lock);
+	index->lock.free();
 
 	dict_mem_index_free(index);
 }
@@ -2803,10 +2803,10 @@ dict_index_build_internal_fts(
 		table->fts->cache = fts_cache_create(table);
 	}
 
-	rw_lock_x_lock(&table->fts->cache->init_lock);
+	mysql_mutex_lock(&table->fts->cache->init_lock);
 	/* Notify the FTS cache about this index. */
 	fts_cache_index_cache_create(table, new_index);
-	rw_lock_x_unlock(&table->fts->cache->init_lock);
+	mysql_mutex_unlock(&table->fts->cache->init_lock);
 
 	return(new_index);
 }
@@ -4279,8 +4279,7 @@ dict_set_corrupted(
 	dict_index_copy_types(tuple, sys_index, 2);
 
 	btr_cur_search_to_nth_level(sys_index, 0, tuple, PAGE_CUR_LE,
-				    BTR_MODIFY_LEAF,
-				    &cursor, 0, __FILE__, __LINE__, &mtr);
+				    BTR_MODIFY_LEAF, &cursor, 0, &mtr);
 
 	if (cursor.low_match == dtuple_get_n_fields(tuple)) {
 		/* UPDATE SYS_INDEXES SET TYPE=index->type
@@ -4381,8 +4380,7 @@ dict_index_set_merge_threshold(
 	dict_index_copy_types(tuple, sys_index, 2);
 
 	btr_cur_search_to_nth_level(sys_index, 0, tuple, PAGE_CUR_GE,
-				    BTR_MODIFY_LEAF,
-				    &cursor, 0, __FILE__, __LINE__, &mtr);
+				    BTR_MODIFY_LEAF, &cursor, 0, &mtr);
 
 	if (cursor.up_match == dtuple_get_n_fields(tuple)
 	    && rec_get_n_fields_old(btr_cur_get_rec(&cursor))
@@ -4418,10 +4416,10 @@ dict_set_merge_threshold_list_debug(
 		for (dict_index_t* index = UT_LIST_GET_FIRST(table->indexes);
 		     index != NULL;
 		     index = UT_LIST_GET_NEXT(indexes, index)) {
-			rw_lock_x_lock(dict_index_get_lock(index));
+			index->lock.x_lock(SRW_LOCK_CALL);
 			index->merge_threshold = merge_threshold_all
 				& ((1U << 6) - 1);
-			rw_lock_x_unlock(dict_index_get_lock(index));
+			index->lock.x_unlock();
 		}
 	}
 }
@@ -4950,7 +4948,7 @@ void dict_sys_t::close()
 
   mutex_exit(&mutex);
   mutex_free(&mutex);
-  rw_lock_free(&latch);
+  latch.destroy();
 
   mutex_free(&dict_foreign_err_mutex);
 

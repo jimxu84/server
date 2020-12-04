@@ -1481,8 +1481,6 @@ row_ins_check_foreign_constraint(
 	upd_node= NULL;
 #endif /* WITH_WSREP */
 
-	ut_ad(rw_lock_own(&dict_sys.latch, RW_LOCK_S));
-
 	err = DB_SUCCESS;
 
 	if (trx->check_foreigns == FALSE) {
@@ -2081,8 +2079,7 @@ row_ins_scan_sec_index_for_duplicate(
 
 	rec_offs_init(offsets_);
 
-	ut_ad(s_latch == rw_lock_own_flagged(
-			&index->lock, RW_LOCK_FLAG_S | RW_LOCK_FLAG_SX));
+	ut_ad(s_latch == (index->lock.have_u_not_x() || index->lock.have_s()));
 
 	n_unique = dict_index_get_n_unique(index);
 
@@ -2613,7 +2610,7 @@ row_ins_clust_index_entry_low(
 	the function will return in both low_match and up_match of the
 	cursor sensible values */
  	err = btr_pcur_open_low(index, 0, entry, PAGE_CUR_LE, mode, &pcur,
-			  __FILE__, __LINE__, auto_inc, &mtr);
+				auto_inc, &mtr);
 	if (err != DB_SUCCESS) {
 		index->table->file_unreadable = true;
 		mtr.commit();
@@ -2927,7 +2924,7 @@ row_ins_sec_index_entry_low(
 		err = btr_cur_search_to_nth_level(
 			index, 0, entry, PAGE_CUR_RTREE_INSERT,
 			search_mode,
-			&cursor, 0, __FILE__, __LINE__, &mtr);
+			&cursor, 0, &mtr);
 
 		if (mode == BTR_MODIFY_LEAF && rtr_info.mbr_adj) {
 			mtr_commit(&mtr);
@@ -2942,7 +2939,7 @@ row_ins_sec_index_entry_low(
 			err = btr_cur_search_to_nth_level(
 				index, 0, entry, PAGE_CUR_RTREE_INSERT,
 				search_mode,
-				&cursor, 0, __FILE__, __LINE__, &mtr);
+				&cursor, 0, &mtr);
 			mode = BTR_MODIFY_TREE;
 		}
 
@@ -2954,7 +2951,7 @@ row_ins_sec_index_entry_low(
 		err = btr_cur_search_to_nth_level(
 			index, 0, entry, PAGE_CUR_LE,
 			search_mode,
-			&cursor, 0, __FILE__, __LINE__, &mtr);
+			&cursor, 0, &mtr);
 	}
 
 	if (err != DB_SUCCESS) {
@@ -3048,7 +3045,7 @@ row_ins_sec_index_entry_low(
 			index, 0, entry, PAGE_CUR_LE,
 			(search_mode
 			 & ~(BTR_INSERT | BTR_IGNORE_SEC_UNIQUE)),
-			&cursor, 0, __FILE__, __LINE__, &mtr);
+			&cursor, 0, &mtr);
 	}
 
 	if (row_ins_must_modify_rec(&cursor)) {
@@ -3503,22 +3500,9 @@ row_ins_alloc_row_id_step(
 /*======================*/
 	ins_node_t*	node)	/*!< in: row insert node */
 {
-	row_id_t	row_id;
-
-	ut_ad(node->state == INS_NODE_ALLOC_ROW_ID);
-
-	if (dict_index_is_unique(dict_table_get_first_index(node->table))) {
-
-		/* No row id is stored if the clustered index is unique */
-
-		return;
-	}
-
-	/* Fill in row id value to row */
-
-	row_id = dict_sys_get_new_row_id();
-
-	dict_sys_write_row_id(node->sys_buf, row_id);
+  ut_ad(node->state == INS_NODE_ALLOC_ROW_ID);
+  if (dict_table_get_first_index(node->table)->is_gen_clust())
+    dict_sys_write_row_id(node->sys_buf, dict_sys.get_new_row_id());
 }
 
 /***********************************************************//**

@@ -299,8 +299,6 @@ btr_height_get(
 
 		/* Release the S latch on the root page. */
 		mtr->memo_release(root_block, MTR_MEMO_PAGE_S_FIX);
-
-		ut_d(sync_check_unlock(&root_block->lock));
 	}
 
 	return(height);
@@ -361,14 +359,11 @@ btr_root_adjust_on_import(
 	buf_block_t* block = buf_page_get_gen(
 		page_id_t(table->space->id, index->page),
 		table->space->zip_size(), RW_X_LATCH, NULL, BUF_GET,
-		__FILE__, __LINE__,
 		&mtr, &err);
 	if (!block) {
 		ut_ad(err != DB_SUCCESS);
 		goto func_exit;
 	}
-
-	buf_block_dbg_add_level(block, SYNC_TREE_NODE);
 
 	page = buf_block_get_frame(block);
 	page_zip = buf_block_get_page_zip(block);
@@ -492,8 +487,6 @@ btr_page_alloc_for_ibuf(
 		index->table->space->zip_size(),
 		RW_X_LATCH, mtr);
 
-	buf_block_dbg_add_level(new_block, SYNC_IBUF_TREE_NODE_NEW);
-
 	flst_remove(root, PAGE_HEADER + PAGE_BTR_IBUF_FREE_LIST,
 		    new_block, PAGE_HEADER + PAGE_BTR_IBUF_FREE_LIST_NODE,
 		    mtr);
@@ -559,21 +552,13 @@ btr_page_alloc(
 					for x-latching and initializing
 					the page */
 {
-	buf_block_t*	new_block;
-
 	if (dict_index_is_ibuf(index)) {
 
 		return(btr_page_alloc_for_ibuf(index, mtr));
 	}
 
-	new_block = btr_page_alloc_low(
+	return btr_page_alloc_low(
 		index, hint_page_no, file_direction, level, mtr, init_mtr);
-
-	if (new_block) {
-		buf_block_dbg_add_level(new_block, SYNC_TREE_NODE_NEW);
-	}
-
-	return(new_block);
 }
 
 /**************************************************************//**
@@ -604,7 +589,7 @@ btr_get_size(
 	if (!root) {
 		return ULINT_UNDEFINED;
 	}
-	mtr_x_lock_space(index->table->space, mtr);
+	mtr->x_lock_space(index->table->space);
 	if (flag == BTR_N_LEAF_PAGES) {
 		fseg_n_reserved_pages(*root, PAGE_HEADER + PAGE_BTR_SEG_LEAF
 				      + root->frame, &n, mtr);
@@ -652,7 +637,7 @@ btr_get_size_and_reserved(
 		return ULINT_UNDEFINED;
 	}
 
-	mtr_x_lock_space(index->table->space, mtr);
+	mtr->x_lock_space(index->table->space);
 
 	ulint n = fseg_n_reserved_pages(*root, PAGE_HEADER + PAGE_BTR_SEG_LEAF
 					+ root->frame, used, mtr);
@@ -691,9 +676,10 @@ btr_page_free_for_ibuf(
 @param[in,out]	index	index tree
 @param[in,out]	block	block to be freed
 @param[in,out]	mtr	mini-transaction
-@param[in]	blob	whether this is freeing a BLOB page */
+@param[in]	blob	whether this is freeing a BLOB page
+@param[in]	latched	whether index->table->space->x_lock() was called */
 void btr_page_free(dict_index_t* index, buf_block_t* block, mtr_t* mtr,
-		   bool blob)
+		   bool blob, bool space_latched)
 {
 	ut_ad(mtr->memo_contains_flagged(block, MTR_MEMO_PAGE_X_FIX));
 #ifdef BTR_CUR_HASH_ADAPT
@@ -726,8 +712,8 @@ void btr_page_free(dict_index_t* index, buf_block_t* block, mtr_t* mtr,
 					  ? PAGE_HEADER + PAGE_BTR_SEG_LEAF
 					  : PAGE_HEADER + PAGE_BTR_SEG_TOP];
 	fseg_free_page(seg_header,
-		       index->table->space, id.page_no(), mtr);
-	buf_page_free(id, mtr, __FILE__, __LINE__);
+		       index->table->space, id.page_no(), mtr, space_latched);
+	buf_page_free(id, mtr);
 
 	/* The page was marked free in the allocation bitmap, but it
 	should remain exclusively latched until mtr_t::commit() or until it
@@ -797,8 +783,6 @@ btr_page_get_father_node_ptr_func(
 				its page x-latched */
 	ulint		latch_mode,/*!< in: BTR_CONT_MODIFY_TREE
 				or BTR_CONT_SEARCH_TREE */
-	const char*	file,	/*!< in: file name */
-	unsigned	line,	/*!< in: line where called */
 	mtr_t*		mtr)	/*!< in: mtr */
 {
 	dtuple_t*	tuple;
@@ -831,15 +815,12 @@ btr_page_get_father_node_ptr_func(
 
 	err = btr_cur_search_to_nth_level(
 		index, level + 1, tuple,
-		PAGE_CUR_LE, latch_mode, cursor, 0,
-		file, line, mtr);
+		PAGE_CUR_LE, latch_mode, cursor, 0, mtr);
 
 	if (err != DB_SUCCESS) {
 		ib::warn() << " Error code: " << err
 			<< " btr_page_get_father_node_ptr_func "
 			<< " level: " << level + 1
-			<< " called from file: "
-			<< file << " line: " << line
 			<< " table: " << index->table->name
 			<< " index: " << index->name();
 	}
@@ -882,11 +863,11 @@ btr_page_get_father_node_ptr_func(
 
 #define btr_page_get_father_node_ptr(of,heap,cur,mtr)			\
 	btr_page_get_father_node_ptr_func(				\
-		of,heap,cur,BTR_CONT_MODIFY_TREE,__FILE__,__LINE__,mtr)
+		of,heap,cur,BTR_CONT_MODIFY_TREE,mtr)
 
 #define btr_page_get_father_node_ptr_for_validate(of,heap,cur,mtr)	\
 	btr_page_get_father_node_ptr_func(				\
-		of,heap,cur,BTR_CONT_SEARCH_TREE,__FILE__,__LINE__,mtr)
+		of,heap,cur,BTR_CONT_SEARCH_TREE,mtr)
 
 /************************************************************//**
 Returns the upper level node pointer to a page. It is assumed that mtr holds
@@ -980,8 +961,6 @@ btr_free_root_check(
 		page_id, zip_size, RW_X_LATCH, mtr);
 
 	if (block) {
-		buf_block_dbg_add_level(block, SYNC_TREE_NODE);
-
 		if (fil_page_index_page_check(block->frame)
 		    && index_id == btr_page_get_index_id(block->frame)) {
 			/* This should be a root page.
@@ -1031,9 +1010,6 @@ btr_create(
 			return(FIL_NULL);
 		}
 
-		buf_block_dbg_add_level(
-			ibuf_hdr_block, SYNC_IBUF_TREE_NODE_NEW);
-
 		ut_ad(ibuf_hdr_block->page.id().page_no()
 		      == IBUF_HEADER_PAGE_NO);
 		/* Allocate then the next page to the segment: it will be the
@@ -1051,8 +1027,6 @@ btr_create(
 
 		ut_ad(block->page.id() == page_id_t(0,IBUF_TREE_ROOT_PAGE_NO));
 
-		buf_block_dbg_add_level(block, SYNC_IBUF_TREE_NODE_NEW);
-
 		flst_init(block, PAGE_HEADER + PAGE_BTR_IBUF_FREE_LIST, mtr);
 	} else {
 		block = fseg_create(space, PAGE_HEADER + PAGE_BTR_SEG_TOP,
@@ -1062,8 +1036,6 @@ btr_create(
 			return(FIL_NULL);
 		}
 
-		buf_block_dbg_add_level(block, SYNC_TREE_NODE_NEW);
-
 		if (!fseg_create(space, PAGE_HEADER + PAGE_BTR_SEG_LEAF, mtr,
 				 false, block)) {
 			/* Not enough space for new segment, free root
@@ -1071,10 +1043,6 @@ btr_create(
 			btr_free_root(block, mtr);
 			return(FIL_NULL);
 		}
-
-		/* The fseg create acquires a second latch on the page,
-		therefore we must declare it: */
-		buf_block_dbg_add_level(block, SYNC_TREE_NODE_NEW);
 	}
 
 	ut_ad(!page_has_siblings(block->frame));
@@ -2346,14 +2314,11 @@ btr_page_insert_fits(
 Inserts a data tuple to a tree on a non-leaf level. It is assumed
 that mtr holds an x-latch on the tree. */
 void
-btr_insert_on_non_leaf_level_func(
-/*==============================*/
+btr_insert_on_non_leaf_level(
 	ulint		flags,	/*!< in: undo logging and locking flags */
 	dict_index_t*	index,	/*!< in: index */
 	ulint		level,	/*!< in: level, must be > 0 */
 	dtuple_t*	tuple,	/*!< in: the record to be inserted */
-	const char*	file,	/*!< in: file name */
-	unsigned	line,	/*!< in: line where called */
 	mtr_t*		mtr)	/*!< in: mtr */
 {
 	big_rec_t*	dummy_big_rec;
@@ -2372,14 +2337,12 @@ btr_insert_on_non_leaf_level_func(
 		dberr_t err = btr_cur_search_to_nth_level(
 			index, level, tuple, PAGE_CUR_LE,
 			BTR_CONT_MODIFY_TREE,
-			&cursor, 0, file, line, mtr);
+			&cursor, 0, mtr);
 
 		if (err != DB_SUCCESS) {
 			ib::warn() << " Error code: " << err
 				   << " btr_page_get_father_node_ptr_func "
 				   << " level: " << level
-				   << " called from file: "
-				   << file << " line: " << line
 				   << " table: " << index->table->name
 				   << " index: " << index->name;
 		}
@@ -2393,7 +2356,7 @@ btr_insert_on_non_leaf_level_func(
 		btr_cur_search_to_nth_level(index, level, tuple,
 					    PAGE_CUR_RTREE_INSERT,
 					    BTR_CONT_MODIFY_TREE,
-					    &cursor, 0, file, line, mtr);
+					    &cursor, 0, mtr);
 	}
 
 	ut_ad(cursor.flag == BTR_CUR_BINARY);
@@ -2781,8 +2744,7 @@ func_start:
 	ut_ad(!dict_index_is_online_ddl(cursor->index)
 	      || (flags & BTR_CREATE_FLAG)
 	      || dict_index_is_clust(cursor->index));
-	ut_ad(rw_lock_own_flagged(dict_index_get_lock(cursor->index),
-				  RW_LOCK_FLAG_X | RW_LOCK_FLAG_SX));
+	ut_ad(cursor->index->lock.have_u_or_x());
 
 	block = btr_cur_get_block(cursor);
 	page = buf_block_get_frame(block);
@@ -2932,9 +2894,8 @@ insert_empty:
 	    && page_is_leaf(page)
 	    && !dict_index_is_online_ddl(cursor->index)) {
 
-		mtr->memo_release(
-			dict_index_get_lock(cursor->index),
-			MTR_MEMO_X_LOCK | MTR_MEMO_SX_LOCK);
+		mtr->memo_release(&cursor->index->lock,
+				  MTR_MEMO_X_LOCK | MTR_MEMO_SX_LOCK);
 
 		/* NOTE: We cannot release root block latch here, because it
 		has segment header and already modified in most of cases.*/

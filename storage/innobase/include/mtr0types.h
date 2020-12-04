@@ -28,7 +28,7 @@ Created 11/26/1995 Heikki Tuuri
 #define mtr0types_h
 
 #ifndef UNIV_INNOCHECKSUM
-#include "sync0rw.h"
+#include "buf0types.h"
 #else
 #include "univ.i"
 #endif /* UNIV_INNOCHECKSUM */
@@ -339,8 +339,10 @@ enum mtr_memo_type_t {
 
 	MTR_MEMO_SX_LOCK = RW_SX_LATCH << 5,
 
-	/** acquire X-latch on fil_space_t::latch */
-	MTR_MEMO_SPACE_X_LOCK = MTR_MEMO_SX_LOCK << 1
+	/** rd_lock() on fil_space_t::latch */
+	MTR_MEMO_SPACE_X_LOCK = MTR_MEMO_SX_LOCK << 1,
+	/** wr_lock() on fil_space_t::latch */
+	MTR_MEMO_SPACE_S_LOCK = MTR_MEMO_SX_LOCK << 2
 };
 #endif /* !UNIV_CHECKSUM */
 

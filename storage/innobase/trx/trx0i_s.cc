@@ -41,7 +41,6 @@ Created July 17, 2007 Vasil Dimov
 #include "rem0rec.h"
 #include "row0row.h"
 #include "srv0srv.h"
-#include "sync0rw.h"
 #include "sync0sync.h"
 #include "trx0sys.h"
 #include "que0que.h"
@@ -139,8 +138,7 @@ struct i_s_table_cache_t {
 
 /** This structure describes the intermediate buffer */
 struct trx_i_s_cache_t {
-	rw_lock_t	rw_lock;	/*!< read-write lock protecting
-					the rest of this structure */
+	srw_lock rw_lock;		/*!< read-write lock protecting this */
 	Atomic_relaxed<ulonglong> last_read;
 					/*!< last time the cache was read;
 					measured in nanoseconds */
@@ -1138,9 +1136,6 @@ static bool can_cache_be_updated(trx_i_s_cache_t* cache)
 	we are currently holding an exclusive rw lock on the cache.
 	So it is not possible for last_read to be updated while we are
 	reading it. */
-
-	ut_ad(rw_lock_own(&cache->rw_lock, RW_LOCK_X));
-
 	return my_interval_timer() - cache->last_read > CACHE_MIN_IDLE_TIME_NS;
 }
 
@@ -1260,15 +1255,14 @@ trx_i_s_cache_init(
 	trx_i_s_cache_t*	cache)	/*!< out: cache to init */
 {
 	/* The latching is done in the following order:
-	acquire trx_i_s_cache_t::rw_lock, X
+	acquire trx_i_s_cache_t::rw_lock, rwlock
 	acquire lock mutex
 	release lock mutex
 	release trx_i_s_cache_t::rw_lock
-	acquire trx_i_s_cache_t::rw_lock, S
+	acquire trx_i_s_cache_t::rw_lock, rdlock
 	release trx_i_s_cache_t::rw_lock */
 
-	rw_lock_create(trx_i_s_cache_lock_key, &cache->rw_lock,
-		       SYNC_TRX_I_S_RWLOCK);
+	cache->rw_lock.SRW_LOCK_INIT(trx_i_s_cache_lock_key);
 
 	cache->last_read = 0;
 
@@ -1294,7 +1288,7 @@ trx_i_s_cache_free(
 /*===============*/
 	trx_i_s_cache_t*	cache)	/*!< in, own: cache to free */
 {
-	rw_lock_free(&cache->rw_lock);
+	cache->rw_lock.destroy();
 
 	cache->locks_hash.free();
 	ha_storage_free(cache->storage);
@@ -1310,7 +1304,7 @@ trx_i_s_cache_start_read(
 /*=====================*/
 	trx_i_s_cache_t*	cache)	/*!< in: cache */
 {
-	rw_lock_s_lock(&cache->rw_lock);
+	cache->rw_lock.rd_lock(SRW_LOCK_CALL);
 }
 
 /*******************************************************************//**
@@ -1321,7 +1315,7 @@ trx_i_s_cache_end_read(
 	trx_i_s_cache_t*	cache)	/*!< in: cache */
 {
 	cache->last_read = my_interval_timer();
-	rw_lock_s_unlock(&cache->rw_lock);
+	cache->rw_lock.rd_unlock();
 }
 
 /*******************************************************************//**
@@ -1331,7 +1325,7 @@ trx_i_s_cache_start_write(
 /*======================*/
 	trx_i_s_cache_t*	cache)	/*!< in: cache */
 {
-	rw_lock_x_lock(&cache->rw_lock);
+	cache->rw_lock.wr_lock(SRW_LOCK_CALL);
 }
 
 /*******************************************************************//**
@@ -1341,9 +1335,7 @@ trx_i_s_cache_end_write(
 /*====================*/
 	trx_i_s_cache_t*	cache)	/*!< in: cache */
 {
-	ut_ad(rw_lock_own(&cache->rw_lock, RW_LOCK_X));
-
-	rw_lock_x_unlock(&cache->rw_lock);
+	cache->rw_lock.wr_unlock();
 }
 
 /*******************************************************************//**
@@ -1356,9 +1348,6 @@ cache_select_table(
 	trx_i_s_cache_t*	cache,	/*!< in: whole cache */
 	enum i_s_table		table)	/*!< in: which table */
 {
-	ut_ad(rw_lock_own_flagged(&cache->rw_lock,
-				  RW_LOCK_FLAG_X | RW_LOCK_FLAG_S));
-
 	switch (table) {
 	case I_S_INNODB_TRX:
 		return &cache->innodb_trx;

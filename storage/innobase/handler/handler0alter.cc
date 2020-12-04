@@ -1004,7 +1004,7 @@ struct ha_innobase_inplace_ctx : public inplace_alter_handler_ctx
 			while (dict_index_t* index
 			       = UT_LIST_GET_LAST(instant_table->indexes)) {
 				UT_LIST_REMOVE(instant_table->indexes, index);
-				rw_lock_free(&index->lock);
+				index->lock.free();
 				dict_mem_index_free(index);
 			}
 			for (unsigned i = old_n_v_cols; i--; ) {
@@ -6866,7 +6866,7 @@ error_handling_drop_uncached_1:
 
 		if (ctx->online) {
 			/* Allocate a log for online table rebuild. */
-			rw_lock_x_lock(&clust_index->lock);
+			clust_index->lock.x_lock(SRW_LOCK_CALL);
 			bool ok = row_log_allocate(
 				ctx->prebuilt->trx,
 				clust_index, ctx->new_table,
@@ -6875,7 +6875,7 @@ error_handling_drop_uncached_1:
 				ctx->defaults, ctx->col_map, path,
 				old_table,
 				ctx->allow_not_null);
-			rw_lock_x_unlock(&clust_index->lock);
+			clust_index->lock.x_unlock();
 
 			if (!ok) {
 				error = DB_OUT_OF_MEMORY;
@@ -6941,7 +6941,7 @@ error_handling_drop_uncached:
 				/* No need to allocate a modification log. */
 				DBUG_ASSERT(!index->online_log);
 			} else {
-				rw_lock_x_lock(&ctx->add_index[a]->lock);
+				index->lock.x_lock(SRW_LOCK_CALL);
 
 				bool ok = row_log_allocate(
 					ctx->prebuilt->trx,
@@ -6950,13 +6950,14 @@ error_handling_drop_uncached:
 					path, old_table,
 					ctx->allow_not_null);
 
-				rw_lock_x_unlock(&index->lock);
+				index->lock.x_unlock();
 
 				DBUG_EXECUTE_IF(
 					"innodb_OOM_prepare_add_index",
 					if (ok && a == 1) {
 						row_log_free(
 							index->online_log);
+						index->online_log = NULL;
 						ok = false;
 					});
 
@@ -7126,7 +7127,7 @@ error_handled:
 			dict_index_t* clust_index = dict_table_get_first_index(
 				user_table);
 
-			rw_lock_x_lock(&clust_index->lock);
+			clust_index->lock.x_lock(SRW_LOCK_CALL);
 
 			if (clust_index->online_log) {
 				ut_ad(ctx->online);
@@ -7135,7 +7136,7 @@ error_handled:
 					= ONLINE_INDEX_COMPLETE;
 			}
 
-			rw_lock_x_unlock(&clust_index->lock);
+			clust_index->lock.x_unlock();
 		}
 
 		trx_commit_for_mysql(ctx->trx);
@@ -8312,8 +8313,6 @@ ha_innobase::inplace_alter_table(
 	DBUG_ENTER("inplace_alter_table");
 	DBUG_ASSERT(!srv_read_only_mode);
 	ut_ad(!sync_check_iterate(sync_check()));
-	ut_ad(!rw_lock_own_flagged(&dict_sys.latch,
-				   RW_LOCK_FLAG_X | RW_LOCK_FLAG_S));
 
 	DEBUG_SYNC(m_user_thd, "innodb_inplace_alter_table_enter");
 
@@ -8526,19 +8525,20 @@ innobase_online_rebuild_log_free(
 {
 	dict_index_t* clust_index = dict_table_get_first_index(table);
 	ut_d(dict_sys.assert_locked());
-	rw_lock_x_lock(&clust_index->lock);
+	clust_index->lock.x_lock(SRW_LOCK_CALL);
 
 	if (clust_index->online_log) {
 		ut_ad(dict_index_get_online_status(clust_index)
 		      == ONLINE_INDEX_CREATION);
 		clust_index->online_status = ONLINE_INDEX_COMPLETE;
 		row_log_free(clust_index->online_log);
+		clust_index->online_log = NULL;
 		DEBUG_SYNC_C("innodb_online_rebuild_log_free_aborted");
 	}
 
 	DBUG_ASSERT(dict_index_get_online_status(clust_index)
 		    == ONLINE_INDEX_COMPLETE);
-	rw_lock_x_unlock(&clust_index->lock);
+	clust_index->lock.x_unlock();
 }
 
 /** For each user column, which is part of an index which is not going to be
@@ -10394,9 +10394,9 @@ commit_cache_norebuild(
 
 			/* Mark the index dropped
 			in the data dictionary cache. */
-			rw_lock_x_lock(dict_index_get_lock(index));
+			index->lock.u_lock(SRW_LOCK_CALL);
 			index->page = FIL_NULL;
-			rw_lock_x_unlock(dict_index_get_lock(index));
+			index->lock.u_unlock();
 		}
 
 		trx_start_for_ddl(trx, TRX_DICT_OP_INDEX);

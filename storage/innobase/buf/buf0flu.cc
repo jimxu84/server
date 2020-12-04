@@ -126,6 +126,20 @@ static void buf_flush_validate_skip()
 }
 #endif /* UNIV_DEBUG */
 
+/** Wake up the page cleaner if needed */
+inline void buf_pool_t::page_cleaner_wakeup()
+{
+  if (page_cleaner_idle() &&
+      (srv_max_dirty_pages_pct_lwm == 0.0 ||
+       srv_max_dirty_pages_pct_lwm <=
+       double(UT_LIST_GET_LEN(buf_pool.flush_list)) * 100.0 /
+       double(UT_LIST_GET_LEN(buf_pool.LRU) + UT_LIST_GET_LEN(buf_pool.free))))
+  {
+    page_cleaner_is_idle= false;
+    mysql_cond_signal(&do_flush_list);
+  }
+}
+
 /** Insert a modified block into the flush list.
 @param[in,out]	block	modified block
 @param[in]	lsn	oldest modification */
@@ -145,6 +159,7 @@ void buf_flush_insert_into_flush_list(buf_block_t* block, lsn_t lsn)
 
 	UT_LIST_ADD_FIRST(buf_pool.flush_list, &block->page);
 	ut_d(buf_flush_validate_skip());
+	buf_pool.page_cleaner_wakeup();
 	mysql_mutex_unlock(&buf_pool.flush_list_mutex);
 }
 
@@ -354,11 +369,8 @@ void buf_page_write_complete(const IORequest &request)
     buf_dblwr.write_completed();
   }
 
-  /* Because this thread which does the unlocking might not be the same that
-  did the locking, we use a pass value != 0 in unlock, which simply
-  removes the newest lock debug record, without checking the thread id. */
   if (bpage->state() == BUF_BLOCK_FILE_PAGE)
-    rw_lock_sx_unlock_gen(&((buf_block_t*) bpage)->lock, BUF_IO_WRITE);
+    reinterpret_cast<buf_block_t*>(bpage)->lock.u_unlock(true);
 
   buf_pool.stat.n_pages_written++;
 
@@ -777,8 +789,7 @@ static void buf_release_freed_page(buf_page_t *bpage)
   mysql_mutex_unlock(&buf_pool.flush_list_mutex);
 
   if (uncompressed)
-    rw_lock_sx_unlock_gen(&reinterpret_cast<buf_block_t*>(bpage)->lock,
-                          BUF_IO_WRITE);
+    reinterpret_cast<buf_block_t*>(bpage)->lock.u_unlock(true);
 
   buf_LRU_free_page(bpage, true);
   mysql_mutex_unlock(&buf_pool.mutex);
@@ -800,14 +811,14 @@ static bool buf_flush_page(buf_page_t *bpage, bool lru, fil_space_t *space)
         space->atomic_write_supported);
   ut_ad(space->referenced());
 
-  rw_lock_t *rw_lock;
+  block_lock *rw_lock;
 
   if (bpage->state() != BUF_BLOCK_FILE_PAGE)
     rw_lock= nullptr;
   else
   {
     rw_lock= &reinterpret_cast<buf_block_t*>(bpage)->lock;
-    if (!rw_lock_sx_lock_nowait(rw_lock, BUF_IO_WRITE))
+    if (!rw_lock->u_lock_try(true))
       return false;
   }
 
@@ -855,7 +866,7 @@ static bool buf_flush_page(buf_page_t *bpage, bool lru, fil_space_t *space)
     if (UNIV_UNLIKELY(lsn > log_sys.get_flushed_lsn()))
     {
       if (rw_lock)
-        rw_lock_sx_unlock_gen(rw_lock, BUF_IO_WRITE);
+        rw_lock->u_unlock(true);
       mysql_mutex_lock(&buf_pool.mutex);
       bpage->set_io_fix(BUF_IO_NONE);
       return false;
@@ -1206,14 +1217,14 @@ static void buf_flush_discard_page(buf_page_t *bpage)
   ut_ad(bpage->in_file());
   ut_ad(bpage->oldest_modification());
 
-  rw_lock_t *rw_lock;
+  block_lock *rw_lock;
 
   if (bpage->state() != BUF_BLOCK_FILE_PAGE)
     rw_lock= nullptr;
   else
   {
     rw_lock= &reinterpret_cast<buf_block_t*>(bpage)->lock;
-    if (!rw_lock_sx_lock_nowait(rw_lock, 0))
+    if (!rw_lock->u_lock_try(false))
       return;
   }
 
@@ -1223,7 +1234,7 @@ static void buf_flush_discard_page(buf_page_t *bpage)
   mysql_mutex_unlock(&buf_pool.flush_list_mutex);
 
   if (rw_lock)
-    rw_lock_sx_unlock(rw_lock);
+    rw_lock->u_unlock();
 
   buf_LRU_free_page(bpage, true);
 }
@@ -2028,7 +2039,7 @@ static os_thread_ret_t DECLARE_THREAD(buf_flush_page_cleaner)(void*)
 
 #ifdef UNIV_DEBUG_THREAD_CREATION
   ib::info() << "page_cleaner thread running, id "
-             << os_thread_pf(os_thread_get_curr_id());
+             << os_thread_get_curr_id();
 #endif /* UNIV_DEBUG_THREAD_CREATION */
 #ifdef UNIV_LINUX
   /* linux might be able to set different setting for each thread.
@@ -2067,8 +2078,12 @@ furious_flush:
     else if (srv_shutdown_state > SRV_SHUTDOWN_INITIATED)
       break;
 
-    mysql_cond_timedwait(&buf_pool.do_flush_list, &buf_pool.flush_list_mutex,
-                         &abstime);
+    if (buf_pool.page_cleaner_idle())
+      mysql_cond_wait(&buf_pool.do_flush_list, &buf_pool.flush_list_mutex);
+    else
+      mysql_cond_timedwait(&buf_pool.do_flush_list, &buf_pool.flush_list_mutex,
+                           &abstime);
+
     set_timespec(abstime, 1);
 
     lsn_limit= buf_flush_sync_lsn;
@@ -2091,6 +2106,8 @@ furious_flush:
         /* wake up buf_flush_wait_flushed() */
         mysql_cond_broadcast(&buf_pool.done_flush_list);
       }
+unemployed:
+      buf_pool.page_cleaner_set_idle(true);
       continue;
     }
 
@@ -2101,13 +2118,14 @@ furious_flush:
       double(UT_LIST_GET_LEN(buf_pool.LRU) + UT_LIST_GET_LEN(buf_pool.free));
 
     if (dirty_pct < srv_max_dirty_pages_pct_lwm && !lsn_limit)
-      continue;
+      goto unemployed;
 
     const lsn_t oldest_lsn= buf_pool.get_oldest_modification(0);
 
     if (UNIV_UNLIKELY(lsn_limit != 0) && oldest_lsn >= lsn_limit)
       buf_flush_sync_lsn= 0;
 
+    buf_pool.page_cleaner_set_idle(false);
     mysql_mutex_unlock(&buf_pool.flush_list_mutex);
 
     ulint n_flushed;
@@ -2158,6 +2176,11 @@ do_checkpoint:
                                      n_flushed);
         goto do_checkpoint;
       }
+    }
+    else
+    {
+      mysql_mutex_lock(&buf_pool.flush_list_mutex);
+      goto unemployed;
     }
 
 #ifdef UNIV_DEBUG

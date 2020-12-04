@@ -493,10 +493,7 @@ const struct _ft_vft_ext ft_vft_ext_result = {innobase_fts_get_version,
 
 #ifdef HAVE_PSI_INTERFACE
 # define PSI_KEY(n) {&n##_key, #n, 0}
-/* All RWLOCK used in Innodb are SX-locks */
-# define PSI_RWLOCK_KEY(n) {&n##_key, #n, PSI_RWLOCK_FLAG_SX}
-
-/* Keys to register pthread mutexes/cond in the current file with
+/** Keys to register pthread mutexes/cond in the current file with
 performance schema */
 static mysql_pfs_key_t	commit_cond_mutex_key;
 static mysql_pfs_key_t	commit_cond_key;
@@ -522,6 +519,8 @@ static PSI_mutex_info all_innodb_mutexes[] = {
 	PSI_KEY(recalc_pool_mutex),
 	PSI_KEY(fil_system_mutex),
 	PSI_KEY(flush_list_mutex),
+	PSI_KEY(fts_cache_mutex),
+	PSI_KEY(fts_cache_init_mutex),
 	PSI_KEY(fts_delete_mutex),
 	PSI_KEY(fts_doc_id_mutex),
 	PSI_KEY(log_flush_order_mutex),
@@ -535,10 +534,6 @@ static PSI_mutex_info all_innodb_mutexes[] = {
 	PSI_KEY(recv_sys_mutex),
 	PSI_KEY(redo_rseg_mutex),
 	PSI_KEY(noredo_rseg_mutex),
-#  ifdef UNIV_DEBUG
-	PSI_KEY(rw_lock_debug_mutex),
-#  endif /* UNIV_DEBUG */
-	PSI_KEY(rw_lock_list_mutex),
 	PSI_KEY(srv_innodb_monitor_mutex),
 	PSI_KEY(srv_misc_tmpfile_mutex),
 	PSI_KEY(srv_monitor_file_mutex),
@@ -560,21 +555,16 @@ static PSI_mutex_info all_innodb_mutexes[] = {
 /* all_innodb_rwlocks array contains rwlocks that are
 performance schema instrumented if "UNIV_PFS_RWLOCK"
 is defined */
-static PSI_rwlock_info all_innodb_rwlocks[] = {
-	PSI_RWLOCK_KEY(btr_search_latch),
-#  ifndef PFS_SKIP_BUFFER_MUTEX_RWLOCK
-	PSI_RWLOCK_KEY(buf_block_lock),
-#  endif /* !PFS_SKIP_BUFFER_MUTEX_RWLOCK */
-#  ifdef UNIV_DEBUG
-	PSI_RWLOCK_KEY(buf_block_debug_latch),
-#  endif /* UNIV_DEBUG */
-	PSI_RWLOCK_KEY(dict_operation_lock),
-	PSI_RWLOCK_KEY(fil_space_latch),
-	PSI_RWLOCK_KEY(fts_cache_rw_lock),
-	PSI_RWLOCK_KEY(fts_cache_init_rw_lock),
-	PSI_RWLOCK_KEY(trx_i_s_cache_lock),
-	PSI_RWLOCK_KEY(trx_purge_latch),
-	PSI_RWLOCK_KEY(index_tree_rw_lock),
+static PSI_rwlock_info all_innodb_rwlocks[] =
+{
+#  ifdef BTR_CUR_HASH_ADAPT
+  { &btr_search_latch_key, "btr_search_latch", 0 },
+#  endif
+  { &dict_operation_lock_key, "dict_operation_lock", 0 },
+  { &fil_space_latch_key, "fil_space_latch", 0 },
+  { &trx_i_s_cache_lock_key, "trx_i_s_cache_lock", 0 },
+  { &trx_purge_latch_key, "trx_purge_latch", 0 },
+  { &index_tree_rw_lock_key, "index_tree_rw_lock", PSI_RWLOCK_FLAG_SX }
 };
 # endif /* UNIV_PFS_RWLOCK */
 
@@ -1470,7 +1460,7 @@ thd_trx_is_auto_commit(
 	       && !thd_test_options(
 		       thd,
 		       OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN)
-	       && thd_is_select(thd));
+	       && thd_sql_command(thd) == SQLCOM_SELECT);
 }
 
 /******************************************************************//**
@@ -1504,17 +1494,6 @@ thd_query_start_micro(
 	const THD*	thd)	/*!< in: thread handle */
 {
 	return thd_start_utime(thd);
-}
-
-/******************************************************************//**
-Returns true if the thread is executing a SELECT statement.
-@return true if thd is executing SELECT */
-ibool
-thd_is_select(
-/*==========*/
-	const THD*	thd)	/*!< in: thread handle */
-{
-	return(thd_sql_command(thd) == SQLCOM_SELECT);
 }
 
 /******************************************************************//**
@@ -11383,10 +11362,10 @@ innobase_parse_hint_from_comment(
 
 			/* x-lock index is needed to exclude concurrent
 			pessimistic tree operations */
-			rw_lock_x_lock(dict_index_get_lock(index));
+			index->lock.x_lock(SRW_LOCK_CALL);
 			index->merge_threshold = merge_threshold_table
 				& ((1U << 6) - 1);
-			rw_lock_x_unlock(dict_index_get_lock(index));
+			index->lock.x_unlock();
 
 			continue;
 		}
@@ -11403,11 +11382,11 @@ innobase_parse_hint_from_comment(
 
 				/* x-lock index is needed to exclude concurrent
 				pessimistic tree operations */
-				rw_lock_x_lock(dict_index_get_lock(index));
+				index->lock.x_lock(SRW_LOCK_CALL);
 				index->merge_threshold
 					= merge_threshold_index[i]
 					& ((1U << 6) - 1);
-				rw_lock_x_unlock(dict_index_get_lock(index));
+				index->lock.x_unlock();
 				is_found[i] = true;
 
 				break;
@@ -15859,126 +15838,6 @@ innodb_show_mutex_status(
 	DBUG_RETURN(0);
 }
 
-/** Implements the SHOW MUTEX STATUS command.
-@param[in,out]	hton		the innodb handlerton
-@param[in,out]	thd		the MySQL query thread of the caller
-@param[in,out]	stat_print	function for printing statistics
-@return 0 on success. */
-static
-int
-innodb_show_rwlock_status(
-	handlerton*
-#ifdef DBUG_ASSERT_EXISTS
-	hton
-#endif
-	,
-	THD*		thd,
-	stat_print_fn*	stat_print)
-{
-	DBUG_ENTER("innodb_show_rwlock_status");
-
-	const rw_lock_t* block_rwlock= nullptr;
-	ulint		block_rwlock_oswait_count = 0;
-	uint		hton_name_len = (uint) strlen(innobase_hton_name);
-
-	DBUG_ASSERT(hton == innodb_hton_ptr);
-
-	mutex_enter(&rw_lock_list_mutex);
-
-	for (const rw_lock_t& rw_lock : rw_lock_list) {
-
-		if (rw_lock.count_os_wait == 0) {
-			continue;
-		}
-
-		int		buf1len;
-		char		buf1[IO_SIZE];
-
-		if (rw_lock.is_block_lock) {
-
-			block_rwlock = &rw_lock;
-			block_rwlock_oswait_count += rw_lock.count_os_wait;
-
-			continue;
-		}
-
-		buf1len = snprintf(
-			buf1, sizeof buf1, "rwlock: %s:%u",
-			innobase_basename(rw_lock.cfile_name),
-			rw_lock.cline);
-
-		int		buf2len;
-		char		buf2[IO_SIZE];
-
-		buf2len = snprintf(
-			buf2, sizeof buf2, "waits=%u",
-			rw_lock.count_os_wait);
-
-		if (stat_print(thd, innobase_hton_name,
-			       hton_name_len,
-			       buf1, static_cast<uint>(buf1len),
-			       buf2, static_cast<uint>(buf2len))) {
-
-			mutex_exit(&rw_lock_list_mutex);
-
-			DBUG_RETURN(1);
-		}
-	}
-
-	if (block_rwlock != NULL) {
-
-		int		buf1len;
-		char		buf1[IO_SIZE];
-
-		buf1len = snprintf(
-			buf1, sizeof buf1, "sum rwlock: %s:%u",
-			innobase_basename(block_rwlock->cfile_name),
-			block_rwlock->cline);
-
-		int		buf2len;
-		char		buf2[IO_SIZE];
-
-		buf2len = snprintf(
-			buf2, sizeof buf2, "waits=" ULINTPF,
-			block_rwlock_oswait_count);
-
-		if (stat_print(thd, innobase_hton_name,
-			       hton_name_len,
-			       buf1, static_cast<uint>(buf1len),
-			       buf2, static_cast<uint>(buf2len))) {
-
-			mutex_exit(&rw_lock_list_mutex);
-
-			DBUG_RETURN(1);
-		}
-	}
-
-	mutex_exit(&rw_lock_list_mutex);
-
-	DBUG_RETURN(0);
-}
-
-/** Implements the SHOW MUTEX STATUS command.
-@param[in,out]	hton		the innodb handlerton
-@param[in,out]	thd		the MySQL query thread of the caller
-@param[in,out]	stat_print	function for printing statistics
-@return 0 on success. */
-static
-int
-innodb_show_latch_status(
-	handlerton*	hton,
-	THD*		thd,
-	stat_print_fn*	stat_print)
-{
-	int	ret = innodb_show_mutex_status(hton, thd, stat_print);
-
-	if (ret != 0) {
-		return(ret);
-	}
-
-	return(innodb_show_rwlock_status(hton, thd, stat_print));
-}
-
 /************************************************************************//**
 Return 0 on success and non-zero on failure. Note: the bool return type
 seems to be abused here, should be an int. */
@@ -16000,7 +15859,7 @@ innobase_show_status(
 		return(innodb_show_status(hton, thd, stat_print) != 0);
 
 	case HA_ENGINE_MUTEX:
-		return(innodb_show_latch_status(hton, thd, stat_print) != 0);
+		return(innodb_show_mutex_status(hton, thd, stat_print) != 0);
 
 	case HA_ENGINE_LOGS:
 		/* Not handled */
@@ -16965,6 +16824,7 @@ innodb_max_dirty_pages_pct_update(
 				    in_val);
 
 		srv_max_dirty_pages_pct_lwm = in_val;
+		mysql_cond_signal(&buf_pool.do_flush_list);
 	}
 
 	srv_max_buf_pool_modified_pct = in_val;
@@ -16998,6 +16858,7 @@ innodb_max_dirty_pages_pct_lwm_update(
 	}
 
 	srv_max_dirty_pages_pct_lwm = in_val;
+	mysql_cond_signal(&buf_pool.do_flush_list);
 }
 
 /*************************************************************//**
@@ -19710,7 +19571,6 @@ i_s_innodb_sys_foreign,
 i_s_innodb_sys_foreign_cols,
 i_s_innodb_sys_tablespaces,
 i_s_innodb_sys_virtual,
-i_s_innodb_mutexes,
 i_s_innodb_sys_semaphore_waits,
 i_s_innodb_tablespaces_encryption
 maria_declare_plugin_end;

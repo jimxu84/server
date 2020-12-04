@@ -2417,18 +2417,18 @@ i_s_fts_deleted_generic_fill(
 
 	/* Prevent DROP of the internal tables for fulltext indexes.
 	FIXME: acquire DDL-blocking MDL on the user table name! */
-	rw_lock_s_lock(&dict_sys.latch);
+	dict_sys.freeze();
 
 	user_table = dict_table_open_on_id(
 		innodb_ft_aux_table_id, FALSE, DICT_TABLE_OP_NORMAL);
 
 	if (!user_table) {
-		rw_lock_s_unlock(&dict_sys.latch);
+func_exit:
+		dict_sys.unfreeze();
 		DBUG_RETURN(0);
 	} else if (!dict_table_has_fts_index(user_table)) {
 		dict_table_close(user_table, FALSE, FALSE);
-		rw_lock_s_unlock(&dict_sys.latch);
-		DBUG_RETURN(0);
+		goto func_exit;
 	}
 
 	deleted = fts_doc_ids_create();
@@ -2444,7 +2444,7 @@ i_s_fts_deleted_generic_fill(
 
 	dict_table_close(user_table, FALSE, FALSE);
 
-	rw_lock_s_unlock(&dict_sys.latch);
+	dict_sys.unfreeze();
 
 	trx->free();
 
@@ -2793,14 +2793,14 @@ i_s_fts_index_cache_fill(
 
 	/* Prevent DROP of the internal tables for fulltext indexes.
 	FIXME: acquire DDL-blocking MDL on the user table name! */
-	rw_lock_s_lock(&dict_sys.latch);
+	dict_sys.freeze();
 
 	user_table = dict_table_open_on_id(
 		innodb_ft_aux_table_id, FALSE, DICT_TABLE_OP_NORMAL);
 
 	if (!user_table) {
 no_fts:
-		rw_lock_s_unlock(&dict_sys.latch);
+		dict_sys.unfreeze();
 		DBUG_RETURN(0);
 	}
 
@@ -2817,7 +2817,7 @@ no_fts:
 	conv_str.f_len = sizeof word;
 	conv_str.f_str = word;
 
-	rw_lock_s_lock(&cache->lock);
+	mysql_mutex_lock(&cache->lock);
 
 	for (ulint i = 0; i < ib_vector_size(cache->indexes); i++) {
 		fts_index_cache_t*      index_cache;
@@ -2829,9 +2829,9 @@ no_fts:
 				 index_cache, thd, &conv_str, tables));
 	}
 
-	rw_lock_s_unlock(&cache->lock);
+	mysql_mutex_unlock(&cache->lock);
 	dict_table_close(user_table, FALSE, FALSE);
-	rw_lock_s_unlock(&dict_sys.latch);
+	dict_sys.unfreeze();
 
 	DBUG_RETURN(ret);
 }
@@ -3243,13 +3243,13 @@ i_s_fts_index_table_fill(
 
 	/* Prevent DROP of the internal tables for fulltext indexes.
 	FIXME: acquire DDL-blocking MDL on the user table name! */
-	rw_lock_s_lock(&dict_sys.latch);
+	dict_sys.freeze();
 
 	user_table = dict_table_open_on_id(
 		innodb_ft_aux_table_id, FALSE, DICT_TABLE_OP_NORMAL);
 
 	if (!user_table) {
-		rw_lock_s_unlock(&dict_sys.latch);
+		dict_sys.unfreeze();
 		DBUG_RETURN(0);
 	}
 
@@ -3269,7 +3269,7 @@ i_s_fts_index_table_fill(
 
 	dict_table_close(user_table, FALSE, FALSE);
 
-	rw_lock_s_unlock(&dict_sys.latch);
+	dict_sys.unfreeze();
 
 	ut_free(conv_str.f_str);
 
@@ -3397,14 +3397,14 @@ i_s_fts_config_fill(
 
 	/* Prevent DROP of the internal tables for fulltext indexes.
 	FIXME: acquire DDL-blocking MDL on the user table name! */
-	rw_lock_s_lock(&dict_sys.latch);
+	dict_sys.freeze();
 
 	user_table = dict_table_open_on_id(
 		innodb_ft_aux_table_id, FALSE, DICT_TABLE_OP_NORMAL);
 
 	if (!user_table) {
 no_fts:
-		rw_lock_s_unlock(&dict_sys.latch);
+		dict_sys.unfreeze();
 		DBUG_RETURN(0);
 	}
 
@@ -3468,7 +3468,7 @@ no_fts:
 
 	dict_table_close(user_table, FALSE, FALSE);
 
-	rw_lock_s_unlock(&dict_sys.latch);
+	dict_sys.unfreeze();
 
 	trx->free();
 
@@ -5107,7 +5107,7 @@ i_s_sys_tables_fill_table_stats(
 	}
 
 	heap = mem_heap_create(1000);
-	rw_lock_s_lock(&dict_sys.latch);
+	dict_sys.freeze();
 	mutex_enter(&dict_sys.mutex);
 	mtr_start(&mtr);
 
@@ -5141,11 +5141,11 @@ i_s_sys_tables_fill_table_stats(
 					    err_msg);
 		}
 
-		rw_lock_s_unlock(&dict_sys.latch);
+		dict_sys.unfreeze();
 		mem_heap_empty(heap);
 
 		/* Get the next record */
-		rw_lock_s_lock(&dict_sys.latch);
+		dict_sys.freeze();
 		mutex_enter(&dict_sys.mutex);
 
 		mtr_start(&mtr);
@@ -5154,7 +5154,7 @@ i_s_sys_tables_fill_table_stats(
 
 	mtr_commit(&mtr);
 	mutex_exit(&dict_sys.mutex);
-	rw_lock_s_unlock(&dict_sys.latch);
+	dict_sys.unfreeze();
 	mem_heap_free(heap);
 
 	DBUG_RETURN(0);
@@ -6878,182 +6878,6 @@ UNIV_INTERN struct st_maria_plugin	i_s_innodb_tablespaces_encryption =
 	/* Maria extension */
 	STRUCT_FLD(version_info, INNODB_VERSION_STR),
 	STRUCT_FLD(maturity, MariaDB_PLUGIN_MATURITY_STABLE)
-};
-
-namespace Show {
-/**  INNODB_MUTEXES  *********************************************/
-/* Fields of the dynamic table INFORMATION_SCHEMA.INNODB_MUTEXES */
-static ST_FIELD_INFO	innodb_mutexes_fields_info[] =
-{
-#define MUTEXES_NAME			0
-  Column("NAME", Varchar(OS_FILE_MAX_PATH), NOT_NULL),
-
-#define MUTEXES_CREATE_FILE		1
-  Column("CREATE_FILE", Varchar(OS_FILE_MAX_PATH), NOT_NULL),
-
-#define MUTEXES_CREATE_LINE		2
-  Column("CREATE_LINE", ULong(), NOT_NULL),
-
-#define MUTEXES_OS_WAITS		3
-  Column("OS_WAITS", ULonglong(), NOT_NULL),
-
-  CEnd()
-};
-} // namespace Show
-
-/*******************************************************************//**
-Function to populate INFORMATION_SCHEMA.INNODB_MUTEXES table.
-Loop through each record in mutex and rw_lock lists, and extract the column
-information and fill the INFORMATION_SCHEMA.INNODB_MUTEXES table.
-@return 0 on success */
-static
-int
-i_s_innodb_mutexes_fill_table(
-/*==========================*/
-	THD*		thd,	/*!< in: thread */
-	TABLE_LIST*	tables,	/*!< in/out: tables to fill */
-	Item*		)	/*!< in: condition (not used) */
-{
-	ulint		block_lock_oswait_count = 0;
-	const rw_lock_t* block_lock= nullptr;
-	Field**		fields = tables->table->field;
-
-	DBUG_ENTER("i_s_innodb_mutexes_fill_table");
-	RETURN_IF_INNODB_NOT_STARTED(tables->schema_table_name.str);
-
-	/* deny access to user without PROCESS_ACL privilege */
-	if (check_global_access(thd, PROCESS_ACL)) {
-		DBUG_RETURN(0);
-	} else {
-		struct Locking
-		{
-			Locking() { mutex_enter(&rw_lock_list_mutex); }
-			~Locking() { mutex_exit(&rw_lock_list_mutex); }
-		} locking;
-
-		char lock_name[sizeof "buf0dump.cc:12345"];
-
-		for (const rw_lock_t& lock : rw_lock_list) {
-			if (lock.count_os_wait == 0) {
-				continue;
-			}
-
-			if (buf_pool.is_block_lock(&lock)) {
-				block_lock = &lock;
-				block_lock_oswait_count += lock.count_os_wait;
-				continue;
-			}
-
-			const char* basename = innobase_basename(
-				lock.cfile_name);
-
-			snprintf(lock_name, sizeof lock_name, "%s:%u",
-				 basename, lock.cline);
-
-			OK(field_store_string(fields[MUTEXES_NAME],
-					      lock_name));
-			OK(field_store_string(fields[MUTEXES_CREATE_FILE],
-					      basename));
-			OK(fields[MUTEXES_CREATE_LINE]->store(lock.cline,
-							      true));
-			fields[MUTEXES_CREATE_LINE]->set_notnull();
-			OK(fields[MUTEXES_OS_WAITS]->store(lock.count_os_wait,
-							   true));
-			fields[MUTEXES_OS_WAITS]->set_notnull();
-			OK(schema_table_store_record(thd, tables->table));
-		}
-
-		if (block_lock) {
-			char buf1[IO_SIZE];
-
-			snprintf(buf1, sizeof buf1, "combined %s",
-				 innobase_basename(block_lock->cfile_name));
-
-			OK(field_store_string(fields[MUTEXES_NAME],
-					      "buf_block_t::lock"));
-			OK(field_store_string(fields[MUTEXES_CREATE_FILE],
-					      buf1));
-			OK(fields[MUTEXES_CREATE_LINE]->store(block_lock->cline,
-							      true));
-			fields[MUTEXES_CREATE_LINE]->set_notnull();
-			OK(fields[MUTEXES_OS_WAITS]->store(
-				   block_lock_oswait_count, true));
-			fields[MUTEXES_OS_WAITS]->set_notnull();
-			OK(schema_table_store_record(thd, tables->table));
-		}
-	}
-
-	DBUG_RETURN(0);
-}
-
-/*******************************************************************//**
-Bind the dynamic table INFORMATION_SCHEMA.INNODB_MUTEXES
-@return 0 on success */
-static
-int
-innodb_mutexes_init(
-/*================*/
-	void*	p)	/*!< in/out: table schema object */
-{
-	ST_SCHEMA_TABLE*	schema;
-
-	DBUG_ENTER("innodb_mutexes_init");
-
-	schema = (ST_SCHEMA_TABLE*) p;
-
-	schema->fields_info = Show::innodb_mutexes_fields_info;
-	schema->fill_table = i_s_innodb_mutexes_fill_table;
-
-	DBUG_RETURN(0);
-}
-
-UNIV_INTERN struct st_maria_plugin	i_s_innodb_mutexes =
-{
-	/* the plugin type (a MYSQL_XXX_PLUGIN value) */
-	/* int */
-	STRUCT_FLD(type, MYSQL_INFORMATION_SCHEMA_PLUGIN),
-
-	/* pointer to type-specific plugin descriptor */
-	/* void* */
-	STRUCT_FLD(info, &i_s_info),
-
-	/* plugin name */
-	/* const char* */
-	STRUCT_FLD(name, "INNODB_MUTEXES"),
-
-	/* plugin author (for SHOW PLUGINS) */
-	/* const char* */
-	STRUCT_FLD(author, plugin_author),
-
-	/* general descriptive text (for SHOW PLUGINS) */
-	/* const char* */
-	STRUCT_FLD(descr, "Information on InnoDB rw-locks"),
-
-	/* the plugin license (PLUGIN_LICENSE_XXX) */
-	/* int */
-	STRUCT_FLD(license, PLUGIN_LICENSE_GPL),
-
-	/* the function to invoke when plugin is loaded */
-	/* int (*)(void*); */
-	STRUCT_FLD(init, innodb_mutexes_init),
-
-	/* the function to invoke when plugin is unloaded */
-	/* int (*)(void*); */
-	STRUCT_FLD(deinit, i_s_common_deinit),
-
-	/* plugin version (for SHOW PLUGINS) */
-	/* unsigned int */
-	STRUCT_FLD(version, INNODB_VERSION_SHORT),
-
-	/* struct st_mysql_show_var* */
-	STRUCT_FLD(status_vars, NULL),
-
-	/* struct st_mysql_sys_var** */
-	STRUCT_FLD(system_vars, NULL),
-
-        /* Maria extension */
-	STRUCT_FLD(version_info, INNODB_VERSION_STR),
-        STRUCT_FLD(maturity, MariaDB_PLUGIN_MATURITY_STABLE),
 };
 
 namespace Show {

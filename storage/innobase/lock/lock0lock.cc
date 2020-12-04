@@ -292,15 +292,12 @@ bool
 lock_validate();
 /*============*/
 
-/*********************************************************************//**
-Validates the record lock queues on a page.
-@return TRUE if ok */
-static
-ibool
-lock_rec_validate_page(
-/*===================*/
-	const buf_block_t*	block)	/*!< in: buffer block */
-	MY_ATTRIBUTE((warn_unused_result));
+/** Validate the record lock queues on a page.
+@param block    buffer pool block
+@param latched  whether the tablespace latch may be held
+@return true if ok */
+static bool lock_rec_validate_page(const buf_block_t *block, bool latched)
+  MY_ATTRIBUTE((nonnull, warn_unused_result));
 #endif /* UNIV_DEBUG */
 
 /* The lock system */
@@ -1875,8 +1872,6 @@ lock_rec_cancel(
 /*============*/
 	lock_t*	lock)	/*!< in: waiting record lock request */
 {
-	que_thr_t*	thr;
-
 	ut_ad(lock_mutex_own());
 	ut_ad(lock_get_type_low(lock) == LOCK_REC);
 
@@ -1887,17 +1882,13 @@ lock_rec_cancel(
 
 	lock_reset_lock_and_trx_wait(lock);
 
-	/* The following function releases the trx from lock wait */
-
-	trx_mutex_enter(lock->trx);
-
-	thr = que_thr_end_lock_wait(lock->trx);
-
-	if (thr != NULL) {
+	/* The following releases the trx from lock wait */
+	trx_t *trx = lock->trx;
+	trx_mutex_enter(trx);
+	if (que_thr_t* thr = que_thr_end_lock_wait(trx)) {
 		lock_wait_release_thread_if_suspended(thr);
 	}
-
-	trx_mutex_exit(lock->trx);
+	trx_mutex_exit(trx);
 }
 
 /** Remove a record lock request, waiting or granted, from the queue and
@@ -2379,7 +2370,10 @@ lock_move_reorganize_page(
 	mem_heap_free(heap);
 
 #ifdef UNIV_DEBUG_LOCK_VALIDATE
-	ut_ad(lock_rec_validate_page(block));
+	if (fil_space_t* space = fil_space_t::get(page_id.space())) {
+		ut_ad(lock_rec_validate_page(block, space->is_latched()));
+		space->release();
+	}
 #endif
 }
 
@@ -2491,8 +2485,12 @@ lock_move_rec_list_end(
 	lock_mutex_exit();
 
 #ifdef UNIV_DEBUG_LOCK_VALIDATE
-	ut_ad(lock_rec_validate_page(block));
-	ut_ad(lock_rec_validate_page(new_block));
+	if (fil_space_t* space = fil_space_t::get(page_id.space())) {
+		const bool is_latched{space->is_latched()};
+		ut_ad(lock_rec_validate_page(block, is_latched));
+		ut_ad(lock_rec_validate_page(new_block, is_latched));
+		space->release();
+	}
 #endif
 }
 
@@ -3751,7 +3749,6 @@ lock_rec_unlock(
 	heap_no = page_rec_get_heap_no(rec);
 
 	lock_mutex_enter();
-	trx_mutex_enter(trx);
 
 	first_lock = lock_rec_get_first(&lock_sys.rec_hash, block, heap_no);
 
@@ -3766,7 +3763,6 @@ lock_rec_unlock(
 	}
 
 	lock_mutex_exit();
-	trx_mutex_exit(trx);
 
 	{
 		ib::error	err;
@@ -3805,7 +3801,6 @@ released:
 	}
 
 	lock_mutex_exit();
-	trx_mutex_exit(trx);
 }
 
 #ifdef UNIV_DEBUG
@@ -3921,7 +3916,8 @@ lock_trx_table_locks_remove(
 	ut_ad(lock_mutex_own());
 
 	/* It is safe to read this because we are holding the lock mutex */
-	if (!trx->lock.cancel) {
+	const bool have_mutex = trx->lock.cancel;
+	if (!have_mutex) {
 		trx_mutex_enter(trx);
 	} else {
 		ut_ad(trx_mutex_own(trx));
@@ -3938,16 +3934,12 @@ lock_trx_table_locks_remove(
 		if (lock == lock_to_remove) {
 			*it = NULL;
 
-			if (!trx->lock.cancel) {
+			if (!have_mutex) {
 				trx_mutex_exit(trx);
 			}
 
 			return;
 		}
-	}
-
-	if (!trx->lock.cancel) {
-		trx_mutex_exit(trx);
 	}
 
 	/* Lock must exist in the vector. */
@@ -4536,14 +4528,11 @@ func_exit:
 	goto func_exit;
 }
 
-/*********************************************************************//**
-Validates the record lock queues on a page.
-@return TRUE if ok */
-static
-ibool
-lock_rec_validate_page(
-/*===================*/
-	const buf_block_t*	block)	/*!< in: buffer block */
+/** Validate the record lock queues on a page.
+@param block    buffer pool block
+@param latched  whether the tablespace latch may be held
+@return true if ok */
+static bool lock_rec_validate_page(const buf_block_t *block, bool latched)
 {
 	const lock_t*	lock;
 	const rec_t*	rec;
@@ -4577,8 +4566,8 @@ loop:
 	ut_ad(!trx_is_ac_nl_ro(lock->trx));
 
 	/* Only validate the record queues when this thread is not
-	holding a space->latch. */
-	if (!sync_check_find(SYNC_FSP))
+	holding a tablespace latch. */
+	if (!latched)
 	for (i = nth_bit; i < lock_rec_get_n_bits(lock); i++) {
 
 		if (i == PAGE_HEAP_NO_SUPREMUM
@@ -4679,7 +4668,7 @@ static void lock_rec_block_validate(const page_id_t page_id)
 			space->zip_size(),
 			RW_X_LATCH, NULL,
 			BUF_GET_POSSIBLY_FREED,
-			__FILE__, __LINE__, &mtr, &err);
+			&mtr, &err);
 
 		if (err != DB_SUCCESS) {
 			ib::error() << "Lock rec block validate failed for tablespace "
@@ -4687,11 +4676,8 @@ static void lock_rec_block_validate(const page_id_t page_id)
 				   << page_id << " err " << err;
 		}
 
-		if (block) {
-			buf_block_dbg_add_level(block, SYNC_NO_ORDER_CHECK);
-
-			ut_ad(lock_rec_validate_page(block));
-		}
+		ut_ad(!block || lock_rec_validate_page(block,
+						       space->is_latched()));
 
 		mtr_commit(&mtr);
 
@@ -5011,9 +4997,7 @@ static void lock_rec_other_trx_holds_expl(trx_t *caller_trx, trx_t *trx,
     ut_ad(!page_rec_is_metadata(rec));
     lock_mutex_enter();
     ut_ad(trx->is_referenced());
-    trx_mutex_enter(trx);
-    const trx_state_t state = trx->state;
-    trx_mutex_exit(trx);
+    const trx_state_t state{trx->state};
     ut_ad(state != TRX_STATE_NOT_STARTED);
     if (state == TRX_STATE_COMMITTED_IN_MEMORY)
     {

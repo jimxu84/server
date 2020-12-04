@@ -145,7 +145,7 @@ private:
 };
 
 
-#ifdef HAVE_IB_LINUX_FUTEX
+#ifdef __linux__
 
 #include <linux/futex.h>
 #include <sys/syscall.h>
@@ -261,7 +261,7 @@ private:
 	std::atomic<int32>	m_lock_word;
 };
 
-#endif /* HAVE_IB_LINUX_FUTEX */
+#endif /* __linux__ */
 
 template <template <typename> class Policy>
 struct TTASMutex {
@@ -457,7 +457,7 @@ struct TTASEventMutex {
 
 				sync_cell_t*	cell;
 				sync_array_t *sync_arr = sync_array_get_and_reserve_cell(
-					this, SYNC_MUTEX,
+					this,
 					filename, line, &cell);
 
 				uint32_t oldval = MUTEX_STATE_LOCKED;

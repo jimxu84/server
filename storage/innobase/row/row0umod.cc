@@ -214,8 +214,6 @@ static bool row_undo_mod_must_purge(undo_node_t* node, mtr_t* mtr)
 	ut_ad(btr_cur->index->is_primary());
 	DEBUG_SYNC_C("rollback_purge_clust");
 
-	mtr->s_lock(&purge_sys.latch, __FILE__, __LINE__);
-
 	if (!purge_sys.changes_visible(node->new_trx_id, node->table->name)) {
 		return false;
 	}
@@ -239,6 +237,7 @@ row_undo_mod_clust(
 {
 	btr_pcur_t*	pcur;
 	mtr_t		mtr;
+	bool		have_latch = false;
 	dberr_t		err;
 	dict_index_t*	index;
 	bool		online;
@@ -246,8 +245,6 @@ row_undo_mod_clust(
 	ut_ad(thr_get_trx(thr) == node->trx);
 	ut_ad(node->trx->dict_operation_lock_mode);
 	ut_ad(node->trx->in_rollback);
-	ut_ad(rw_lock_own_flagged(&dict_sys.latch,
-				  RW_LOCK_FLAG_X | RW_LOCK_FLAG_S));
 
 	log_free_check();
 	pcur = &node->pcur;
@@ -308,11 +305,7 @@ row_undo_mod_clust(
 	ut_ad(online || !dict_index_is_online_ddl(index));
 
 	if (err == DB_SUCCESS && online) {
-
-		ut_ad(rw_lock_own_flagged(
-				&index->lock,
-				RW_LOCK_FLAG_S | RW_LOCK_FLAG_X
-				| RW_LOCK_FLAG_SX));
+		ut_ad(index->lock.have_any());
 
 		switch (node->rec_type) {
 		case TRX_UNDO_DEL_MARK_REC:
@@ -365,22 +358,31 @@ row_undo_mod_clust(
 			goto mtr_commit_exit;
 		}
 
+		ut_ad(rec_get_deleted_flag(btr_pcur_get_rec(pcur),
+					   dict_table_is_comp(node->table)));
+
 		if (index->table->is_temporary()) {
 			mtr.set_log_mode(MTR_LOG_NO_REDO);
+			if (btr_cur_optimistic_delete(&pcur->btr_cur, 0,
+						      &mtr)) {
+				goto mtr_commit_exit;
+			}
+			btr_pcur_commit_specify_mtr(pcur, &mtr);
 		} else {
+			index->set_modified(mtr);
+			have_latch = true;
+			purge_sys.latch.rd_lock(SRW_LOCK_CALL);
 			if (!row_undo_mod_must_purge(node, &mtr)) {
 				goto mtr_commit_exit;
 			}
-			index->set_modified(mtr);
+			if (btr_cur_optimistic_delete(&pcur->btr_cur, 0,
+						      &mtr)) {
+				goto mtr_commit_exit;
+			}
+			purge_sys.latch.rd_unlock();
+			btr_pcur_commit_specify_mtr(pcur, &mtr);
+			have_latch = false;
 		}
-
-		ut_ad(rec_get_deleted_flag(btr_pcur_get_rec(pcur),
-					   dict_table_is_comp(node->table)));
-		if (btr_cur_optimistic_delete(&pcur->btr_cur, 0, &mtr)) {
-			goto mtr_commit_exit;
-		}
-
-		btr_pcur_commit_specify_mtr(pcur, &mtr);
 
 		mtr.start();
 		if (!btr_pcur_restore_position(
@@ -389,17 +391,19 @@ row_undo_mod_clust(
 			goto mtr_commit_exit;
 		}
 
+		ut_ad(rec_get_deleted_flag(btr_pcur_get_rec(pcur),
+					   dict_table_is_comp(node->table)));
+
 		if (index->table->is_temporary()) {
 			mtr.set_log_mode(MTR_LOG_NO_REDO);
 		} else {
+			have_latch = true;
+			purge_sys.latch.rd_lock(SRW_LOCK_CALL);
 			if (!row_undo_mod_must_purge(node, &mtr)) {
 				goto mtr_commit_exit;
 			}
 			index->set_modified(mtr);
 		}
-
-		ut_ad(rec_get_deleted_flag(btr_pcur_get_rec(pcur),
-					   dict_table_is_comp(node->table)));
 
 		/* This operation is analogous to purge, we can free
 		also inherited externally stored fields. We can also
@@ -409,8 +413,7 @@ row_undo_mod_clust(
 		rollback=false, just like purge does. */
 		btr_cur_pessimistic_delete(&err, FALSE, &pcur->btr_cur, 0,
 					   false, &mtr);
-		ut_ad(err == DB_SUCCESS
-		      || err == DB_OUT_OF_FILE_SPACE);
+		ut_ad(err == DB_SUCCESS || err == DB_OUT_OF_FILE_SPACE);
 	} else if (!index->table->is_temporary() && node->new_trx_id) {
 		/* We rolled back a record so that it still exists.
 		We must reset the DB_TRX_ID if the history is no
@@ -421,7 +424,8 @@ row_undo_mod_clust(
 			goto mtr_commit_exit;
 		}
 		rec_t* rec = btr_pcur_get_rec(pcur);
-		mtr.s_lock(&purge_sys.latch, __FILE__, __LINE__);
+		have_latch = true;
+		purge_sys.latch.rd_lock(SRW_LOCK_CALL);
 		if (!purge_sys.changes_visible(node->new_trx_id,
 					       node->table->name)) {
 			goto mtr_commit_exit;
@@ -493,6 +497,10 @@ row_undo_mod_clust(
 	}
 
 mtr_commit_exit:
+	if (have_latch) {
+		purge_sys.latch.rd_unlock();
+	}
+
 	btr_pcur_commit_specify_mtr(pcur, &mtr);
 
 func_exit:
@@ -1313,7 +1321,7 @@ close_table:
 	}
 
 	/* Extract indexed virtual columns from undo log */
-	if (node->table->n_v_cols) {
+	if (node->ref != &trx_undo_metadata && node->table->n_v_cols) {
 		row_upd_replace_vcol(node->row, node->table,
 				     node->update, false, node->undo_row,
 				     (node->cmpl_info & UPD_NODE_NO_ORD_CHANGE)

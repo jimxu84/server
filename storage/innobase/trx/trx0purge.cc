@@ -36,7 +36,6 @@ Created 3/26/1996 Heikki Tuuri
 #include "srv0mon.h"
 #include "srv0srv.h"
 #include "srv0start.h"
-#include "sync0sync.h"
 #include "trx0rec.h"
 #include "trx0roll.h"
 #include "trx0rseg.h"
@@ -44,6 +43,10 @@ Created 3/26/1996 Heikki Tuuri
 #include <mysql/service_wsrep.h>
 
 #include <unordered_map>
+
+#ifdef UNIV_PFS_RWLOCK
+extern mysql_pfs_key_t trx_purge_latch_key;
+#endif /* UNIV_PFS_RWLOCK */
 
 /** Maximum allowable purge history length.  <=0 means 'infinite'. */
 ulong		srv_max_purge_lag = 0;
@@ -172,7 +175,7 @@ void purge_sys_t::create()
   offset= 0;
   hdr_page_no= 0;
   hdr_offset= 0;
-  rw_lock_create(trx_purge_latch_key, &latch, SYNC_PURGE_LATCH);
+  latch.SRW_LOCK_INIT(trx_purge_latch_key);
   mutex_create(LATCH_ID_PURGE_SYS_PQ, &pq_mutex);
   truncate.current= NULL;
   truncate.last= NULL;
@@ -193,7 +196,7 @@ void purge_sys_t::close()
   ut_ad(trx->state == TRX_STATE_ACTIVE);
   trx->state= TRX_STATE_NOT_STARTED;
   trx->free();
-  rw_lock_free(&latch);
+  latch.destroy();
   mutex_free(&pq_mutex);
   mem_heap_free(heap);
   heap= nullptr;
@@ -694,7 +697,7 @@ not_free:
 		mtr_t mtr;
 		const ulint size = SRV_UNDO_TABLESPACE_SIZE_IN_PAGES;
 		mtr.start();
-		mtr_x_lock_space(purge_sys.truncate.current, &mtr);
+		mtr.x_lock_space(purge_sys.truncate.current);
 		/* Associate the undo tablespace with mtr.
 		During mtr::commit(), InnoDB can use the undo
 		tablespace object to clear all freed ranges */

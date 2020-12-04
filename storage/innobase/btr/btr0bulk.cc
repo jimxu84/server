@@ -834,7 +834,7 @@ PageBulk::release()
 	finish();
 
 	/* We fix the block because we will re-pin it soon. */
-	buf_block_buf_fix_inc(m_block, __FILE__, __LINE__);
+	buf_block_buf_fix_inc(m_block);
 
 	/* No other threads can modify this block. */
 	m_modify_clock = buf_block_get_modify_clock(m_block);
@@ -853,12 +853,12 @@ PageBulk::latch()
 
 	/* In case the block is S-latched by page_cleaner. */
 	if (!buf_page_optimistic_get(RW_X_LATCH, m_block, m_modify_clock,
-				     __FILE__, __LINE__, &m_mtr)) {
+				     &m_mtr)) {
 		m_block = buf_page_get_gen(page_id_t(m_index->table->space_id,
 						     m_page_no),
 					   0, RW_X_LATCH,
 					   m_block, BUF_GET_IF_IN_POOL,
-					   __FILE__, __LINE__, &m_mtr, &m_err);
+					   &m_mtr, &m_err);
 
 		if (m_err != DB_SUCCESS) {
 			return (m_err);
@@ -949,9 +949,7 @@ BtrBulk::pageCommit(
 		page_bulk->set_modified();
 	}
 
-	ut_ad(!rw_lock_own_flagged(&m_index->lock,
-				   RW_LOCK_FLAG_X | RW_LOCK_FLAG_SX
-				   | RW_LOCK_FLAG_S));
+	ut_ad(!m_index->lock.have_any());
 
 	/* Compress page if it's a compressed table. */
 	if (page_bulk->getPageZip() != NULL && !page_bulk->compress()) {

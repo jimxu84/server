@@ -2126,8 +2126,7 @@ dberr_t PageConverter::operator()(buf_block_t* block) UNIV_NOTHROW
 	in the buffer pool, evict it now, because
 	we no longer evict the pages on DISCARD TABLESPACE. */
 	buf_page_get_gen(block->page.id(), get_zip_size(),
-			 RW_NO_LATCH, NULL, BUF_EVICT_IF_IN_POOL,
-			 __FILE__, __LINE__, NULL, NULL);
+			 RW_NO_LATCH, NULL, BUF_EVICT_IF_IN_POOL, NULL);
 
 	uint16_t page_type;
 
@@ -2396,15 +2395,7 @@ row_import_set_sys_max_row_id(
 	if (row_id) {
 		/* Update the system row id if the imported index row id is
 		greater than the max system row id. */
-
-		mutex_enter(&dict_sys.mutex);
-
-		if (row_id >= dict_sys.row_id) {
-			dict_sys.row_id = row_id + 1;
-			dict_hdr_flush_row_id();
-		}
-
-		mutex_exit(&dict_sys.mutex);
+		dict_sys.update_row_id(row_id);
 	}
 }
 
@@ -3912,7 +3903,7 @@ row_import_for_mysql(
 
 	/* Prevent DDL operations while we are checking. */
 
-	rw_lock_s_lock(&dict_sys.latch);
+	dict_sys.freeze();
 
 	row_import	cfg;
 
@@ -3937,14 +3928,14 @@ row_import_for_mysql(
 			autoinc = cfg.m_autoinc;
 		}
 
-		rw_lock_s_unlock(&dict_sys.latch);
+		dict_sys.unfreeze();
 
 		DBUG_EXECUTE_IF("ib_import_set_index_root_failure",
 				err = DB_TOO_MANY_CONCURRENT_TRXS;);
 
 	} else if (cfg.m_missing) {
 
-		rw_lock_s_unlock(&dict_sys.latch);
+		dict_sys.unfreeze();
 
 		/* We don't have a schema file, we will have to discover
 		the index root pages from the .ibd file and skip the schema
@@ -3973,7 +3964,7 @@ row_import_for_mysql(
 			}
 		}
 	} else {
-		rw_lock_s_unlock(&dict_sys.latch);
+		dict_sys.unfreeze();
 	}
 
 	if (err != DB_SUCCESS) {
@@ -4063,7 +4054,7 @@ row_import_for_mysql(
 
 	/* Open the tablespace so that we can access via the buffer pool.
 	We set the 2nd param (fix_dict = true) here because we already
-	have an x-lock on dict_sys.latch and dict_sys.mutex.
+	have locked dict_sys.latch and dict_sys.mutex.
 	The tablespace is initially opened as a temporary one, because
 	we will not be writing any redo log for it before we have invoked
 	fil_space_t::set_imported() to declare it a persistent tablespace. */

@@ -43,10 +43,8 @@ buf_dblwr_t buf_dblwr;
 /** @return the TRX_SYS page */
 inline buf_block_t *buf_dblwr_trx_sys_get(mtr_t *mtr)
 {
-  buf_block_t *block= buf_page_get(page_id_t(TRX_SYS_SPACE, TRX_SYS_PAGE_NO),
-                                   0, RW_X_LATCH, mtr);
-  buf_block_dbg_add_level(block, SYNC_NO_ORDER_CHECK);
-  return block;
+  return buf_page_get(page_id_t(TRX_SYS_SPACE, TRX_SYS_PAGE_NO),
+                      0, RW_X_LATCH, mtr);
 }
 
 /** Initialize the doublewrite buffer data structure.
@@ -121,10 +119,6 @@ too_small:
     the InnoDB system tablespace file in the first place.
     It could be located in separate optional file(s) in a
     user-specified location. */
-
-    /* fseg_create acquires a second latch on the page,
-    therefore we must declare it: */
-    buf_block_dbg_add_level(b, SYNC_NO_ORDER_CHECK);
   }
 
   byte *fseg_header= TRX_SYS_DOUBLEWRITE + TRX_SYS_DOUBLEWRITE_FSEG +
@@ -156,7 +150,7 @@ too_small:
     tablespace, then the page has not been written to in
     doublewrite. */
 
-    ut_ad(rw_lock_get_x_lock_count(&new_block->lock) == 1);
+    ut_ad(new_block->lock.not_recursive());
     const page_id_t id= new_block->page.id();
     /* We only do this in the debug build, to ensure that the check in
     buf_flush_init_for_writing() will see a valid page type. The

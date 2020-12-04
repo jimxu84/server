@@ -880,6 +880,10 @@ bool select_unit_ext::send_eof()
     table->file->ha_rnd_end();
   }
 
+  /* Clean up table buffers for the next set operation from pipeline */
+  if (next_sl)
+    restore_record(table,s->default_values);
+
   if (unlikely(error))
     table->file->print_error(error, MYF(0));
 
@@ -2743,6 +2747,7 @@ bool st_select_lex::cleanup()
     delete join;
     join= 0;
   }
+  leaf_tables.empty();
   for (SELECT_LEX_UNIT *lex_unit= first_inner_unit(); lex_unit ;
        lex_unit= lex_unit->next_unit())
   {

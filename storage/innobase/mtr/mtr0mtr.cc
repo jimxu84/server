@@ -32,6 +32,9 @@ Created 11/26/1995 Heikki Tuuri
 #include "page0types.h"
 #include "mtr0log.h"
 #include "log0recv.h"
+#ifdef BTR_CUR_HASH_ADAPT
+# include "btr0sea.h"
+#endif
 
 /** Iterate over a memo block in reverse. */
 template <typename Functor>
@@ -170,12 +173,12 @@ struct FindPage
 		    || m_ptr >= block->frame + srv_page_size) {
 			return(true);
 		}
-
-		ut_ad(!(m_flags & (MTR_MEMO_PAGE_S_FIX
-				   | MTR_MEMO_PAGE_SX_FIX
-				   | MTR_MEMO_PAGE_X_FIX))
-		      || rw_lock_own_flagged(&block->lock, m_flags));
-
+		ut_ad(!(slot->type & MTR_MEMO_PAGE_S_FIX)
+		      || block->lock.have_s());
+		ut_ad(!(slot->type & MTR_MEMO_PAGE_SX_FIX)
+		      || block->lock.have_u_or_x());
+		ut_ad(!(slot->type & MTR_MEMO_PAGE_X_FIX)
+		      || block->lock.have_x());
 		m_slot = slot;
 		return(false);
 	}
@@ -204,22 +207,21 @@ private:
 @param slot	memo slot */
 static void memo_slot_release(mtr_memo_slot_t *slot)
 {
-  switch (slot->type) {
+  switch (const auto type= slot->type) {
   case MTR_MEMO_S_LOCK:
-    rw_lock_s_unlock(reinterpret_cast<rw_lock_t*>(slot->object));
-    break;
-  case MTR_MEMO_SX_LOCK:
-    rw_lock_sx_unlock(reinterpret_cast<rw_lock_t*>(slot->object));
-    break;
-  case MTR_MEMO_SPACE_X_LOCK:
-    {
-      fil_space_t *space= static_cast<fil_space_t*>(slot->object);
-      space->set_committed_size();
-      rw_lock_x_unlock(&space->latch);
-    }
+    static_cast<index_lock*>(slot->object)->s_unlock();
     break;
   case MTR_MEMO_X_LOCK:
-    rw_lock_x_unlock(reinterpret_cast<rw_lock_t*>(slot->object));
+  case MTR_MEMO_SX_LOCK:
+    static_cast<index_lock*>(slot->object)->
+      u_or_x_unlock(type == MTR_MEMO_SX_LOCK);
+    break;
+  case MTR_MEMO_SPACE_X_LOCK:
+    static_cast<fil_space_t*>(slot->object)->set_committed_size();
+    static_cast<fil_space_t*>(slot->object)->x_unlock();
+    break;
+  case MTR_MEMO_SPACE_S_LOCK:
+    static_cast<fil_space_t*>(slot->object)->s_unlock();
     break;
   default:
 #ifdef UNIV_DEBUG
@@ -234,7 +236,7 @@ static void memo_slot_release(mtr_memo_slot_t *slot)
       break;
     }
 #endif /* UNIV_DEBUG */
-    buf_block_t *block= reinterpret_cast<buf_block_t*>(slot->object);
+    buf_block_t *block= static_cast<buf_block_t*>(slot->object);
     buf_page_release_latch(block, slot->type & ~MTR_MEMO_MODIFY);
     block->unfix();
     break;
@@ -249,22 +251,21 @@ struct ReleaseLatches {
   {
     if (!slot->object)
       return true;
-    switch (slot->type) {
+    switch (const auto type= slot->type) {
     case MTR_MEMO_S_LOCK:
-      rw_lock_s_unlock(reinterpret_cast<rw_lock_t*>(slot->object));
+      static_cast<index_lock*>(slot->object)->s_unlock();
       break;
     case MTR_MEMO_SPACE_X_LOCK:
-      {
-        fil_space_t *space= static_cast<fil_space_t*>(slot->object);
-        space->set_committed_size();
-        rw_lock_x_unlock(&space->latch);
-      }
+      static_cast<fil_space_t*>(slot->object)->set_committed_size();
+      static_cast<fil_space_t*>(slot->object)->x_unlock();
+      break;
+    case MTR_MEMO_SPACE_S_LOCK:
+      static_cast<fil_space_t*>(slot->object)->s_unlock();
       break;
     case MTR_MEMO_X_LOCK:
-      rw_lock_x_unlock(reinterpret_cast<rw_lock_t*>(slot->object));
-      break;
     case MTR_MEMO_SX_LOCK:
-      rw_lock_sx_unlock(reinterpret_cast<rw_lock_t*>(slot->object));
+      static_cast<index_lock*>(slot->object)->
+        u_or_x_unlock(type == MTR_MEMO_SX_LOCK);
       break;
     default:
 #ifdef UNIV_DEBUG
@@ -279,7 +280,7 @@ struct ReleaseLatches {
         break;
       }
 #endif /* UNIV_DEBUG */
-      buf_block_t *block= reinterpret_cast<buf_block_t*>(slot->object);
+      buf_block_t *block= static_cast<buf_block_t*>(slot->object);
       buf_page_release_latch(block, slot->type & ~MTR_MEMO_MODIFY);
       block->unfix();
       break;
@@ -426,7 +427,7 @@ void mtr_t::commit()
         freed_space= fil_system.sys_space;
       }
 
-      ut_ad(memo_contains(*freed_space));
+      ut_ad(freed_space->is_owner());
       /* Update the last freed lsn */
       freed_space->update_last_freed_lsn(m_commit_lsn);
 
@@ -545,13 +546,10 @@ bool mtr_t::is_named_space(const fil_space_t* space) const
 #endif /* UNIV_DEBUG */
 
 /** Acquire a tablespace X-latch.
-NOTE: use mtr_x_lock_space().
 @param[in]	space_id	tablespace ID
-@param[in]	file		file name from where called
-@param[in]	line		line number in file
 @return the tablespace object (never NULL) */
 fil_space_t*
-mtr_t::x_lock_space(ulint space_id, const char* file, unsigned line)
+mtr_t::x_lock_space(ulint space_id)
 {
 	fil_space_t*	space;
 
@@ -569,8 +567,22 @@ mtr_t::x_lock_space(ulint space_id, const char* file, unsigned line)
 
 	ut_ad(space);
 	ut_ad(space->id == space_id);
-	x_lock_space(space, file, line);
+	x_lock_space(space);
 	return(space);
+}
+
+/** Acquire a tablespace X-latch.
+@param[in]	space	tablespace */
+void mtr_t::x_lock_space(fil_space_t *space)
+{
+  ut_ad(space->purpose == FIL_TYPE_TEMPORARY ||
+        space->purpose == FIL_TYPE_IMPORT ||
+        space->purpose == FIL_TYPE_TABLESPACE);
+  if (!memo_contains(*space))
+  {
+    memo_push(space, MTR_MEMO_SPACE_X_LOCK);
+    space->x_lock();
+  }
 }
 
 /** Release an object in the memo stack.
@@ -893,7 +905,7 @@ inline std::pair<lsn_t,bool> mtr_t::finish_write(ulint len)
 	return std::make_pair(start_lsn, flush);
 }
 
-/** Find out whether a block was X-latched by the mini-transaction */
+/** Find out whether a block was not X-latched by the mini-transaction */
 struct FindBlockX
 {
   const buf_block_t &block;
@@ -903,7 +915,7 @@ struct FindBlockX
   /** @return whether the block was not found x-latched */
   bool operator()(const mtr_memo_slot_t *slot) const
   {
-    return slot->object != &block || slot->type == MTR_MEMO_PAGE_X_FIX;
+    return slot->object != &block || slot->type != MTR_MEMO_PAGE_X_FIX;
   }
 };
 
@@ -933,8 +945,148 @@ bool mtr_t::have_x_latch(const buf_block_t &block) const
                                  MTR_MEMO_BUF_FIX | MTR_MEMO_MODIFY));
     return false;
   }
-  ut_ad(rw_lock_own(&block.lock, RW_LOCK_X));
+  ut_ad(block.lock.have_x());
   return true;
+}
+
+/** Check if we are holding exclusive tablespace latch
+@param space  tablespace to search for
+@param shared whether to look for shared latch, instead of exclusive
+@return whether space.latch is being held */
+bool mtr_t::memo_contains(const fil_space_t& space, bool shared)
+{
+  Iterate<Find> iteration(Find(&space, shared
+                               ? MTR_MEMO_SPACE_S_LOCK
+                               : MTR_MEMO_SPACE_X_LOCK));
+  if (m_memo.for_each_block_in_reverse(iteration))
+    return false;
+  ut_ad(shared || space.is_owner());
+  return true;
+}
+
+#ifdef BTR_CUR_HASH_ADAPT
+/** If a stale adaptive hash index exists on the block, drop it.
+Multiple executions of btr_search_drop_page_hash_index() on the
+same block must be prevented by exclusive page latch. */
+ATTRIBUTE_COLD
+static void mtr_defer_drop_ahi(buf_block_t *block, mtr_memo_type_t fix_type)
+{
+  switch (fix_type) {
+  case MTR_MEMO_BUF_FIX:
+    /* We do not drop the adaptive hash index, because safely doing
+    so would require acquiring block->lock, and that is not safe
+    to acquire in some RW_NO_LATCH access paths. Those code paths
+    should have no business accessing the adaptive hash index anyway. */
+    break;
+  case MTR_MEMO_PAGE_S_FIX:
+    /* Temporarily release our S-latch. */
+    block->lock.s_unlock();
+    block->lock.x_lock();
+    if (dict_index_t *index= block->index)
+      if (index->freed())
+        btr_search_drop_page_hash_index(block);
+    block->lock.x_unlock();
+    block->lock.s_lock();
+    break;
+  case MTR_MEMO_PAGE_SX_FIX:
+    block->lock.u_unlock();
+    block->lock.x_lock();
+    if (dict_index_t *index= block->index)
+      if (index->freed())
+        btr_search_drop_page_hash_index(block);
+    block->lock.u_lock();
+    block->lock.x_unlock();
+    break;
+  default:
+    ut_ad(fix_type == MTR_MEMO_PAGE_X_FIX);
+    btr_search_drop_page_hash_index(block);
+  }
+}
+#endif /* BTR_CUR_HASH_ADAPT */
+
+/** Upgrade U-latched pages to X */
+struct UpgradeX
+{
+  const buf_block_t &block;
+  UpgradeX(const buf_block_t &block) : block(block) {}
+  bool operator()(mtr_memo_slot_t *slot) const
+  {
+    if (slot->object == &block && (MTR_MEMO_PAGE_SX_FIX & slot->type))
+      slot->type= static_cast<mtr_memo_type_t>
+        (slot->type ^ (MTR_MEMO_PAGE_SX_FIX | MTR_MEMO_PAGE_X_FIX));
+    return true;
+  }
+};
+
+/** Upgrade U locks on a block to X */
+void mtr_t::page_lock_upgrade(const buf_block_t &block)
+{
+  ut_ad(block.lock.have_x());
+  m_memo.for_each_block(CIterate<UpgradeX>((UpgradeX(block))));
+#ifdef BTR_CUR_HASH_ADAPT
+  ut_ad(!block.index || !block.index->freed());
+#endif /* BTR_CUR_HASH_ADAPT */
+}
+
+/** Upgrade U locks to X */
+struct UpgradeLockX
+{
+  const index_lock &lock;
+  UpgradeLockX(const index_lock &lock) : lock(lock) {}
+  bool operator()(mtr_memo_slot_t *slot) const
+  {
+    if (slot->object == &lock && (MTR_MEMO_SX_LOCK & slot->type))
+      slot->type= static_cast<mtr_memo_type_t>
+        (slot->type ^ (MTR_MEMO_SX_LOCK | MTR_MEMO_X_LOCK));
+    return true;
+  }
+};
+
+/** Upgrade U locks on a block to X */
+void mtr_t::lock_upgrade(const index_lock &lock)
+{
+  ut_ad(lock.have_x());
+  m_memo.for_each_block(CIterate<UpgradeLockX>((UpgradeLockX(lock))));
+}
+
+/** Latch a buffer pool block.
+@param block    block to be latched
+@param rw_latch RW_S_LATCH, RW_SX_LATCH, RW_X_LATCH, RW_NO_LATCH */
+void mtr_t::page_lock(buf_block_t *block, ulint rw_latch)
+{
+  mtr_memo_type_t fix_type;
+  switch (rw_latch)
+  {
+  case RW_NO_LATCH:
+    fix_type= MTR_MEMO_BUF_FIX;
+    goto done;
+  case RW_S_LATCH:
+    fix_type= MTR_MEMO_PAGE_S_FIX;
+    block->lock.s_lock();
+    break;
+  case RW_SX_LATCH:
+    fix_type= MTR_MEMO_PAGE_SX_FIX;
+    block->lock.u_lock();
+    break;
+  default:
+    ut_ad(rw_latch == RW_X_LATCH);
+    fix_type= MTR_MEMO_PAGE_X_FIX;
+    if (block->lock.x_lock_upgraded())
+    {
+      page_lock_upgrade(*block);
+      block->unfix();
+      return;
+    }
+  }
+
+#ifdef BTR_CUR_HASH_ADAPT
+  if (dict_index_t *index= block->index)
+    if (index->freed())
+      mtr_defer_drop_ahi(block, fix_type);
+#endif /* BTR_CUR_HASH_ADAPT */
+
+done:
+  memo_push(block, fix_type);
 }
 
 #ifdef UNIV_DEBUG
@@ -942,7 +1094,7 @@ bool mtr_t::have_x_latch(const buf_block_t &block) const
 @param lock   latch to search for
 @param type   held latch type
 @return whether (lock,type) is contained */
-bool mtr_t::memo_contains(const rw_lock_t &lock, mtr_memo_type_t type)
+bool mtr_t::memo_contains(const index_lock &lock, mtr_memo_type_t type)
 {
   Iterate<Find> iteration(Find(&lock, type));
   if (m_memo.for_each_block_in_reverse(iteration))
@@ -950,30 +1102,18 @@ bool mtr_t::memo_contains(const rw_lock_t &lock, mtr_memo_type_t type)
 
   switch (type) {
   case MTR_MEMO_X_LOCK:
-    ut_ad(rw_lock_own(&lock, RW_LOCK_X));
+    ut_ad(lock.have_x());
     break;
   case MTR_MEMO_SX_LOCK:
-    ut_ad(rw_lock_own(&lock, RW_LOCK_SX));
+    ut_ad(lock.have_u_or_x());
     break;
   case MTR_MEMO_S_LOCK:
-    ut_ad(rw_lock_own(&lock, RW_LOCK_S));
+    ut_ad(lock.have_s());
     break;
   default:
     break;
   }
 
-  return true;
-}
-
-/** Check if we are holding exclusive tablespace latch
-@param space  tablespace to search for
-@return whether space.latch is being held */
-bool mtr_t::memo_contains(const fil_space_t& space)
-{
-  Iterate<Find> iteration(Find(&space, MTR_MEMO_SPACE_X_LOCK));
-  if (m_memo.for_each_block_in_reverse(iteration))
-    return false;
-  ut_ad(rw_lock_own(const_cast<rw_lock_t*>(&space.latch), RW_LOCK_X));
   return true;
 }
 
@@ -1013,20 +1153,29 @@ struct FlaggedCheck {
 	@retval	true	if the iteration should continue */
 	bool operator()(const mtr_memo_slot_t* slot) const
 	{
-		if (m_ptr != slot->object || !(m_flags & slot->type)) {
+		if (m_ptr != slot->object) {
 			return(true);
 		}
 
-		if (ulint flags = m_flags & (MTR_MEMO_PAGE_S_FIX
-					     | MTR_MEMO_PAGE_SX_FIX
-					     | MTR_MEMO_PAGE_X_FIX)) {
-			rw_lock_t* lock = &static_cast<buf_block_t*>(
+		auto f = m_flags & slot->type;
+		if (!f) {
+			return true;
+		}
+
+		if (f & (MTR_MEMO_PAGE_S_FIX | MTR_MEMO_PAGE_SX_FIX
+			 | MTR_MEMO_PAGE_X_FIX)) {
+			block_lock* lock = &static_cast<buf_block_t*>(
 				const_cast<void*>(m_ptr))->lock;
-			ut_ad(rw_lock_own_flagged(lock, flags));
+			ut_ad(!(f & MTR_MEMO_PAGE_S_FIX) || lock->have_s());
+			ut_ad(!(f & MTR_MEMO_PAGE_SX_FIX)
+			      || lock->have_u_or_x());
+			ut_ad(!(f & MTR_MEMO_PAGE_X_FIX) || lock->have_x());
 		} else {
-			rw_lock_t* lock = static_cast<rw_lock_t*>(
+			index_lock* lock = static_cast<index_lock*>(
 				const_cast<void*>(m_ptr));
-			ut_ad(rw_lock_own_flagged(lock, m_flags >> 5));
+			ut_ad(!(f & MTR_MEMO_S_LOCK) || lock->have_s());
+			ut_ad(!(f & MTR_MEMO_SX_LOCK) || lock->have_u_or_x());
+			ut_ad(!(f & MTR_MEMO_X_LOCK) || lock->have_x());
 		}
 
 		return(false);

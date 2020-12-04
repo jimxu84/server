@@ -686,7 +686,7 @@ public:
 			}
 			if (buf_block_t* block = buf_page_get_low(
 				    i.first, 0, RW_X_LATCH, nullptr,
-				    BUF_GET_IF_IN_POOL, __FILE__, __LINE__,
+				    BUF_GET_IF_IN_POOL,
 				    &mtr, nullptr, false)) {
 				if (UNIV_LIKELY_NULL(block->page.zip.data)) {
 					switch (fil_page_get_type(
@@ -2461,9 +2461,9 @@ void recv_recover_page(fil_space_t* space, buf_page_t* bpage)
 	this OS thread, so that we can acquire a second
 	x-latch on it.  This is needed for the operations to
 	the page to pass the debug checks. */
-	rw_lock_x_lock_move_ownership(&block->lock);
-	buf_block_buf_fix_inc(block, __FILE__, __LINE__);
-	rw_lock_x_lock(&block->lock);
+	block->lock.claim_ownership();
+	block->lock.x_lock_recursive();
+	buf_block_buf_fix_inc(block);
 	mtr.memo_push(block, MTR_MEMO_PAGE_X_FIX);
 
 	mutex_enter(&recv_sys.mutex);
@@ -2555,7 +2555,6 @@ inline buf_block_t *recv_sys_t::recover_low(const page_id_t page_id,
     {
       ut_ad(&recs == &recv_sys.pages.find(page_id)->second);
       i.created= true;
-      buf_block_dbg_add_level(block, SYNC_NO_ORDER_CHECK);
       recv_recover_page(block, mtr, p, space, &i);
       ut_ad(mtr.has_committed());
       recs.log.clear();
@@ -2673,10 +2672,8 @@ next_page:
         mtr.set_log_mode(MTR_LOG_NO_REDO);
         if (buf_block_t *block= buf_page_get_low(page_id, 0, RW_X_LATCH,
                                                  nullptr, BUF_GET_IF_IN_POOL,
-                                                 __FILE__, __LINE__,
                                                  &mtr, nullptr, false))
         {
-          buf_block_dbg_add_level(block, SYNC_NO_ORDER_CHECK);
           recv_recover_page(block, mtr, p);
           ut_ad(mtr.has_committed());
         }

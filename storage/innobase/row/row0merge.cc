@@ -158,8 +158,7 @@ public:
 			btr_cur_search_to_nth_level(m_index, 0, dtuple,
 						    PAGE_CUR_RTREE_INSERT,
 						    BTR_MODIFY_LEAF, &ins_cur,
-						    0, __FILE__, __LINE__,
-						    &mtr);
+						    0, &mtr);
 
 			/* It need to update MBR in parent entry,
 			so change search mode to BTR_MODIFY_TREE */
@@ -174,8 +173,7 @@ public:
 				btr_cur_search_to_nth_level(
 					m_index, 0, dtuple,
 					PAGE_CUR_RTREE_INSERT,
-					BTR_MODIFY_TREE, &ins_cur, 0,
-					__FILE__, __LINE__, &mtr);
+					BTR_MODIFY_TREE, &ins_cur, 0, &mtr);
 			}
 
 			error = btr_cur_optimistic_insert(
@@ -197,8 +195,7 @@ public:
 					m_index, 0, dtuple,
 					PAGE_CUR_RTREE_INSERT,
 					BTR_MODIFY_TREE,
-					&ins_cur, 0,
-					__FILE__, __LINE__, &mtr);
+					&ins_cur, 0, &mtr);
 
 				error = btr_cur_pessimistic_insert(
 						flag, &ins_cur, &ins_offsets,
@@ -1820,8 +1817,8 @@ row_merge_read_clustered_index(
 	based on that. */
 
 	clust_index = dict_table_get_first_index(old_table);
-	const ulint old_trx_id_col = DATA_TRX_ID - DATA_N_SYS_COLS
-		+ ulint(old_table->n_cols);
+	const ulint old_trx_id_col = ulint(old_table->n_cols)
+		- (DATA_N_SYS_COLS - DATA_TRX_ID);
 	ut_ad(old_table->cols[old_trx_id_col].mtype == DATA_SYS);
 	ut_ad(old_table->cols[old_trx_id_col].prtype
 	      == (DATA_TRX_ID | DATA_NOT_NULL));
@@ -1950,7 +1947,7 @@ row_merge_read_clustered_index(
 				goto scan_next;
 			}
 
-			if (clust_index->lock.waiters) {
+			if (clust_index->lock.is_waiting()) {
 				/* There are waiters on the clustered
 				index tree lock, likely the purge
 				thread. Store and restore the cursor
@@ -2557,22 +2554,21 @@ write_buffers:
 				from accessing this index, to ensure
 				read consistency. */
 
-				trx_id_t	max_trx_id;
-
 				ut_a(row == NULL);
-				rw_lock_x_lock(
-					dict_index_get_lock(buf->index));
-				ut_a(dict_index_get_online_status(buf->index)
+
+				dict_index_t* index = buf->index;
+				index->lock.x_lock(SRW_LOCK_CALL);
+				ut_a(dict_index_get_online_status(index)
 				     == ONLINE_INDEX_CREATION);
 
-				max_trx_id = row_log_get_max_trx(buf->index);
+				trx_id_t max_trx_id = row_log_get_max_trx(
+					index);
 
-				if (max_trx_id > buf->index->trx_id) {
-					buf->index->trx_id = max_trx_id;
+				if (max_trx_id > index->trx_id) {
+					index->trx_id = max_trx_id;
 				}
 
-				rw_lock_x_unlock(
-					dict_index_get_lock(buf->index));
+				index->lock.x_unlock();
 			}
 
 			/* Secondary index and clustered index which is
@@ -3607,16 +3603,8 @@ row_merge_insert_index_tuples(
 				dtuple, tuple_heap);
 		}
 
-#ifdef UNIV_DEBUG
-		static const latch_level_t latches[] = {
-			SYNC_INDEX_TREE,	/* index->lock */
-			SYNC_LEVEL_VARYING	/* btr_bulk->m_page_bulks */
-		};
-#endif /* UNIV_DEBUG */
-
 		ut_ad(dtuple_validate(dtuple));
-		ut_ad(!sync_check_iterate(sync_allowed_latches(latches,
-							       latches + 2)));
+		ut_ad(!sync_check_iterate(sync_check()));
 		error = btr_bulk->insert(dtuple);
 
 		if (error != DB_SUCCESS) {
@@ -3867,8 +3855,7 @@ row_merge_drop_indexes(
 						table, index);
 					index = prev;
 				} else {
-					rw_lock_x_lock(
-						dict_index_get_lock(index));
+					index->lock.x_lock(SRW_LOCK_CALL);
 					dict_index_set_online_status(
 						index, ONLINE_INDEX_ABORTED);
 					index->type |= DICT_CORRUPT;
@@ -3877,11 +3864,11 @@ row_merge_drop_indexes(
 				}
 				continue;
 			case ONLINE_INDEX_CREATION:
-				rw_lock_x_lock(dict_index_get_lock(index));
+				index->lock.x_lock(SRW_LOCK_CALL);
 				ut_ad(!index->is_committed());
 				row_log_abort_sec(index);
 			drop_aborted:
-				rw_lock_x_unlock(dict_index_get_lock(index));
+				index->lock.x_unlock();
 
 				DEBUG_SYNC_C("merge_drop_index_after_abort");
 				/* covered by dict_sys.mutex */
@@ -3893,10 +3880,10 @@ row_merge_drop_indexes(
 				the tablespace, but keep the object
 				in the data dictionary cache. */
 				row_merge_drop_index_dict(trx, index->id);
-				rw_lock_x_lock(dict_index_get_lock(index));
+				index->lock.x_lock(SRW_LOCK_CALL);
 				dict_index_set_online_status(
 					index, ONLINE_INDEX_ABORTED_DROPPED);
-				rw_lock_x_unlock(dict_index_get_lock(index));
+				index->lock.x_unlock();
 				table->drop_aborted = TRUE;
 				continue;
 			}
@@ -4768,12 +4755,10 @@ func_exit:
 			case ONLINE_INDEX_COMPLETE:
 				break;
 			case ONLINE_INDEX_CREATION:
-				rw_lock_x_lock(
-					dict_index_get_lock(indexes[i]));
+				indexes[i]->lock.x_lock(SRW_LOCK_CALL);
 				row_log_abort_sec(indexes[i]);
 				indexes[i]->type |= DICT_CORRUPT;
-				rw_lock_x_unlock(
-					dict_index_get_lock(indexes[i]));
+				indexes[i]->lock.x_unlock();
 				new_table->drop_aborted = TRUE;
 				/* fall through */
 			case ONLINE_INDEX_ABORTED_DROPPED:

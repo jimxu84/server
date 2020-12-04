@@ -1077,11 +1077,10 @@ sel_set_rtr_rec_lock(
 	ut_ad(page_align(first_rec) == cur_block->frame);
 	ut_ad(match->valid);
 
-	rw_lock_x_lock(&(match->block.lock));
+	match->block.lock.x_lock();
 retry:
 	cur_block = btr_pcur_get_block(pcur);
-	ut_ad(rw_lock_own_flagged(&match->block.lock,
-				  RW_LOCK_FLAG_X | RW_LOCK_FLAG_S));
+	ut_ad(match->block.lock.have_x() || match->block.lock.have_s());
 	ut_ad(page_is_leaf(buf_block_get_frame(cur_block)));
 
 	err = lock_sec_rec_read_check_and_lock(
@@ -1115,8 +1114,7 @@ re_scan:
 			cur_block = buf_page_get_gen(
 				page_id_t(index->table->space_id, page_no),
 				index->table->space->zip_size(),
-				RW_X_LATCH, NULL, BUF_GET,
-				__FILE__, __LINE__, mtr, &err);
+				RW_X_LATCH, NULL, BUF_GET, mtr, &err);
 		} else {
 			mtr->start();
 			goto func_end;
@@ -1196,7 +1194,7 @@ re_scan:
 	match->locked = true;
 
 func_end:
-	rw_lock_x_unlock(&(match->block.lock));
+	match->block.lock.x_unlock();
 	if (heap != NULL) {
 		mem_heap_free(heap);
 	}
@@ -3328,8 +3326,7 @@ Row_sel_get_clust_rec_for_mysql::operator()(
 			buf_block_t*	block = buf_page_get_gen(
 				btr_pcur_get_block(prebuilt->pcur)->page.id(),
 				btr_pcur_get_block(prebuilt->pcur)->zip_size(),
-				RW_NO_LATCH, NULL, BUF_GET,
-				__FILE__, __LINE__, mtr, &err);
+				RW_NO_LATCH, NULL, BUF_GET, mtr, &err);
 			mem_heap_t*	heap = mem_heap_create(256);
 			dtuple_t*       tuple = dict_index_build_data_tuple(
 				rec, sec_index, true,
@@ -3857,15 +3854,15 @@ row_sel_try_search_shortcut_for_mysql(
 	ut_ad(dict_index_is_clust(index));
 	ut_ad(!prebuilt->templ_contains_blob);
 
-	rw_lock_t* ahi_latch = btr_search_sys.get_latch(*index);
-	rw_lock_s_lock(ahi_latch);
+	srw_lock* ahi_latch = btr_search_sys.get_latch(*index);
+	ahi_latch->rd_lock(SRW_LOCK_CALL);
 	btr_pcur_open_with_no_init(index, search_tuple, PAGE_CUR_GE,
 				   BTR_SEARCH_LEAF, pcur, ahi_latch, mtr);
 	rec = btr_pcur_get_rec(pcur);
 
 	if (!page_rec_is_user_rec(rec) || rec_is_metadata(rec, *index)) {
 retry:
-		rw_lock_s_unlock(ahi_latch);
+		ahi_latch->rd_unlock();
 		return(SEL_RETRY);
 	}
 
@@ -3875,7 +3872,7 @@ retry:
 
 	if (btr_pcur_get_up_match(pcur) < dtuple_get_n_fields(search_tuple)) {
 exhausted:
-		rw_lock_s_unlock(ahi_latch);
+		ahi_latch->rd_unlock();
 		return(SEL_EXHAUSTED);
 	}
 
@@ -3899,7 +3896,7 @@ exhausted:
 
 	*out_rec = rec;
 
-	rw_lock_s_unlock(ahi_latch);
+	ahi_latch->rd_unlock();
 	return(SEL_FOUND);
 }
 #endif /* BTR_CUR_HASH_ADAPT */
@@ -4542,12 +4539,11 @@ aborted:
 	      || prebuilt->table->no_rollback()
 	      || srv_read_only_mode);
 
-	/* Do not lock gaps for plain SELECT
-	at READ UNCOMMITTED or READ COMMITTED isolation level */
+	/* Do not lock gaps at READ UNCOMMITTED or READ COMMITTED
+	isolation level */
 	const bool set_also_gap_locks =
 		prebuilt->select_lock_type != LOCK_NONE
-		&& (trx->isolation_level > TRX_ISO_READ_COMMITTED
-		    || !thd_is_select(trx->mysql_thd))
+		&& trx->isolation_level > TRX_ISO_READ_COMMITTED
 #ifdef WITH_WSREP
 		&& !wsrep_thd_skip_locking(trx->mysql_thd)
 #endif /* WITH_WSREP */
@@ -4755,7 +4751,6 @@ rec_loop:
 	if (page_rec_is_supremum(rec)) {
 
 		if (set_also_gap_locks
-		    && trx->isolation_level > TRX_ISO_READ_COMMITTED
 		    && !dict_index_is_spatial(index)) {
 
 			/* Try to place a lock on the index record */
@@ -5020,8 +5015,16 @@ wrong_offs:
 			goto no_gap_lock;
 		}
 
-		if (!set_also_gap_locks
-		    || (unique_search && !rec_get_deleted_flag(rec, comp))
+#ifdef WITH_WSREP
+		if (UNIV_UNLIKELY(!set_also_gap_locks)) {
+			ut_ad(wsrep_thd_skip_locking(trx->mysql_thd));
+			goto no_gap_lock;
+		}
+#else /* WITH_WSREP */
+		ut_ad(set_also_gap_locks);
+#endif /* WITH_WSREP */
+
+		if ((unique_search && !rec_get_deleted_flag(rec, comp))
 		    || dict_index_is_spatial(index)) {
 
 			goto no_gap_lock;
